@@ -1,0 +1,6 @@
+build_host/
+build_switch/
+build/
+dist/
+sd_package/
+.git/

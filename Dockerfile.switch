@@ -1,0 +1,92 @@
+# =============================================================================
+# Dockerfile.switch - Nintendo Switch Cross-Compilation Environment
+# safir: Japanese VN OCR & Popup Dictionary Overlay (.ovl)
+# =============================================================================
+# Usage:
+#   docker build -f Dockerfile.switch -t safir .
+#   docker run --rm -v "$(pwd)/dist:/dist" safir
+# =============================================================================
+
+FROM devkitpro/devkita64:latest AS builder
+
+LABEL maintainer="safir"
+LABEL description="Cross-compiler for safir Tesla overlay (.ovl)"
+
+# Install standard Linux build tools via apt-get
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        make \
+        ninja-build \
+        python3 \
+        python3-pip \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install / update Switch dev packages via dkp-pacman
+RUN dkp-pacman -S --noconfirm --needed \
+        switch-dev \
+        switch-pkg-config \
+        switch-libzstd \
+        switch-bzip2 \
+        switch-freetype
+
+ENV DEVKITPRO=/opt/devkitpro
+ENV DEVKITA64=/opt/devkitpro/devkitA64
+ENV PATH="${DEVKITPRO}/devkitA64/bin:${DEVKITPRO}/tools/bin:${PATH}"
+
+WORKDIR /workspace
+
+# The dictionary first, in its own layers: Docker reuses them until JMdict_english.zip or
+# the packer changes, so a code change no longer repacks the 25 MB dictionary (~12 s).
+# (A missing .cache/JMdict_english.zip fails this COPY loudly: run tools/fetch_assets.py.)
+COPY .cache/JMdict_english.zip tools/dict_packer.py /dict_src/
+RUN mkdir -p /workspace/release && \
+    python3 /dict_src/dict_packer.py /dict_src/JMdict_english.zip -o /workspace/release/dict.bin
+
+# Copy repository source code
+COPY . /workspace
+
+# Ensure libtesla is present in /opt/libs/libtesla if not already present
+RUN if [ ! -f /workspace/libs/libtesla/include/tesla.hpp ]; then \
+        git clone https://github.com/WerWolv/libtesla.git /opt/libs/libtesla; \
+    else \
+        mkdir -p /opt/libs/libtesla && cp -r /workspace/libs/libtesla/* /opt/libs/libtesla/; \
+    fi
+
+# Verify memory ledger compliance before compiling
+RUN python3 tools/check_memory_ledger.py
+
+# Configure and compile safir using Switch.cmake and Ninja
+RUN cmake -B build_switch \
+        -GNinja \
+        -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \
+        -DSAFIR_TARGET=SWITCH \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build_switch --config Release \
+    && echo "=== safir.elf binary section sizes ===" \
+    && (aarch64-none-elf-size build_switch/safir.elf 2>/dev/null || aarch64-none-elf-size build_switch/safir.elf.elf) \
+    && BSS_SIZE=$( (aarch64-none-elf-size build_switch/safir.elf 2>/dev/null || aarch64-none-elf-size build_switch/safir.elf.elf) | awk 'NR==2 {print $3}' ) \
+    && echo "[CHECK] Static .bss size: ${BSS_SIZE} bytes (Ceiling: 1,350,000 bytes)" \
+    && if [ "${BSS_SIZE}" -gt 1350000 ]; then \
+           echo "ERROR: .bss section size ${BSS_SIZE} exceeds 1,350,000 bytes limit!" >&2; exit 1; \
+       fi
+
+# Package the REAL dictionary and release artifacts.
+# (Audit 2026-11-04: this step used to pack tests/fixtures/test_yomitan_fixture.json, a
+#  24-entry fixture, and write it as BOTH safir_dict.bin and dict.bin, so every
+#  `docker run` overwrote the real dist/dict.bin. It also silently synthesized a fake
+#  model when the real one was missing. Both now fail loudly instead.)
+RUN set -e; test -f /workspace/release/dict.bin && \
+    cp -f build_switch/safir.ovl /workspace/release/ && \
+    (cp -f build_switch/safir.elf /workspace/release/ 2>/dev/null || cp -f build_switch/safir.elf.elf /workspace/release/safir.elf) && \
+    if [ -f .cache/models/VOCR6.2_S_w8.vocr ]; then cp -f .cache/models/VOCR6.2_S_w8.vocr /workspace/release/; \
+    else echo "ERROR: VOCR6.2_S_w8.vocr not found in .cache/models/ (run tools/fetch_assets.py)" >&2; exit 1; fi && \
+    if [ -f .cache/models/VOCR6.2_N_w8g2.vocr ]; then cp -f .cache/models/VOCR6.2_N_w8g2.vocr /workspace/release/; \
+    else echo "ERROR: VOCR6.2_N_w8g2.vocr not found in .cache/models/ (bee-san/vita-vn-ocr v0.5.0)" >&2; exit 1; fi && \
+    echo "=== release artifacts ===" && ls -l /workspace/release
+
+# Default entrypoint: export artifacts to /dist (never touches anything else in /dist)
+VOLUME ["/dist"]
+# Only files whose contents changed are copied, so an unchanged dict.bin / model keeps its
+# timestamp in dist/. Prints "updated: <name>" for each file copied.
+ENTRYPOINT ["/bin/bash", "-c", "for f in /workspace/release/*; do n=$(basename \"$f\"); if ! cmp -s \"$f\" \"/dist/$n\"; then cp -f \"$f\" \"/dist/$n\" && echo \"updated: $n\"; fi; done"]

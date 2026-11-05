@@ -1,0 +1,16 @@
+build_host/
+build_switch/
+build/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.exp
+vc140.pdb
+__pycache__/
+build_switch.log
+sd_package/
+local_secrets/
+.cache/
+dist/
