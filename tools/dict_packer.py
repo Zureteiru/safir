@@ -179,10 +179,52 @@ def jmdict_priority(term_tags: str) -> int:
     return best
 
 
-def load_yomitan_zip(zip_path: str) -> List[TermEntry]:
+def parse_freq(val) -> Tuple[str, int]:
+    """(reading or "", rank) from any Yomitan frequency value: 12, {"value": 12, "displayValue": ".."},
+    {"reading": "..", "frequency": 12} or {"reading": "..", "frequency": {"value": 12, ...}}."""
+    if isinstance(val, (int, float)):
+        return "", int(val)
+    if not isinstance(val, dict):
+        return "", 0
+    reading = str(val.get("reading", "") or "")
+    f = val.get("frequency", val)
+    if isinstance(f, (int, float)):
+        return reading, int(f)
+    if isinstance(f, dict):
+        v = f.get("value", f.get("frequency", 0))
+        return reading, int(v) if isinstance(v, (int, float)) else 0
+    return reading, 0
+
+
+def load_freqs(zip_path: str, freqs: Dict[Tuple[str, str], int]) -> int:
+    """Adds a zip's frequency rows to freqs: (term, reading) -> lowest rank; reading "" applies to
+    every reading of the term (as hoshidicts / Yomitan match them). Returns rows read."""
+    rows = 0
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for name in z.namelist():
+            if not (name.startswith("term_meta_bank_") and name.endswith(".json")):
+                continue
+            for item in json.loads(z.read(name).decode('utf-8')):
+                if len(item) >= 3 and item[1] == "freq":
+                    reading, rank = parse_freq(item[2])
+                    if rank <= 0:
+                        continue
+                    key = (str(item[0]), reading)
+                    if key not in freqs or rank < freqs[key]:
+                        freqs[key] = rank
+                    rows += 1
+    return rows
+
+
+# Ranks from a frequency dictionary stay below this; words it does not list come after, in the
+# order of the dictionary's own score (hoshidicts: unlisted = after every listed word).
+FREQ_RANK_LIMIT = 30000
+
+
+def load_yomitan_zip(zip_path: str, freqs: Dict[Tuple[str, str], int] = None) -> List[TermEntry]:
     entries: List[TermEntry] = []
     pitches: Dict[Tuple[str, str], int] = {}
-    freqs: Dict[Tuple[str, str], int] = {}
+    freqs = freqs if freqs is not None else {}
 
     with zipfile.ZipFile(zip_path, 'r') as z:
         namelist = z.namelist()
@@ -209,16 +251,6 @@ def load_yomitan_zip(zip_path: str) -> List[TermEntry]:
                                 mask = 1 << min(pos_num, 15)
                                 pitches[(term, reading)] = mask
                                 pitches[(term, "")] = mask
-                            elif mode == "freq":
-                                reading = term
-                                rank = 0
-                                if isinstance(val, dict):
-                                    reading = val.get("reading", term)
-                                    rank = val.get("frequency", val.get("ranking", 0))
-                                elif isinstance(val, (int, float)):
-                                    rank = int(val)
-                                freqs[(term, reading)] = rank
-                                freqs[(term, "")] = rank
                 except Exception as e:
                     print(f"Warning parsing meta bank {name}: {e}", file=sys.stderr)
 
@@ -269,6 +301,7 @@ def load_yomitan_zip(zip_path: str) -> List[TermEntry]:
         # priority tags break them: 私 (ichi news1k) before 渡し (news11k) for わたし.
         by_score = sorted(order, key=lambda k: (-groups[k]["score"], groups[k].get("prio", 99)))
         score_rank = {k: min(1 + i // 8, 32767) for i, k in enumerate(by_score)}
+        max_score_rank = max(score_rank.values(), default=1)
         for key in order:
             term, reading, _ = key
             g = groups[key]
@@ -278,8 +311,13 @@ def load_yomitan_zip(zip_path: str) -> List[TermEntry]:
             else:
                 glossary = " ".join(f"{i + 1}) {gl}" for i, (_, gl) in enumerate(senses))
             pitch_mask = pitches.get((term, reading), pitches.get((term, ""), 0))
-            fr = freqs.get((term, reading), freqs.get((term, ""), 0))
-            freq_rank = min(int(fr), 32767) if fr else score_rank[key]
+            # hoshidicts: the lowest rank among rows for this reading and rows with no reading
+            fr = min((v for v in (freqs.get((term, reading)), freqs.get((term, ""))) if v), default=0)
+            if freqs:  # a frequency dictionary was given: its rank first, unlisted words after
+                freq_rank = min(fr, FREQ_RANK_LIMIT - 1) if fr else \
+                    FREQ_RANK_LIMIT + min(score_rank[key] * 2766 // max_score_rank, 2766)
+            else:
+                freq_rank = score_rank[key]
             entries.append(TermEntry(term, reading, glossary, g["pos"], pitch_mask, freq_rank))
 
     return entries
@@ -518,11 +556,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Frequency rows from every zip (a frequency-only zip such as Jiten's ranks the terms of the others).
+    freqs: Dict[Tuple[str, str], int] = {}
+    for inp in args.inputs:
+        if inp.endswith(".zip"):
+            n = load_freqs(inp, freqs)
+            if n:
+                print(f"Frequency ranks from {inp}: {n:,} rows")
+
     all_entries: List[TermEntry] = []
     for inp in args.inputs:
         if inp.endswith(".zip"):
             print(f"Loading Yomitan zip dictionary: {inp}")
-            all_entries.extend(load_yomitan_zip(inp))
+            all_entries.extend(load_yomitan_zip(inp, freqs))
         elif inp.endswith(".json"):
             print(f"Loading JSON fixture dictionary: {inp}")
             all_entries.extend(load_json_fixture(inp))

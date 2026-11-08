@@ -36,12 +36,14 @@ ENV PATH="${DEVKITPRO}/devkitA64/bin:${DEVKITPRO}/tools/bin:${PATH}"
 
 WORKDIR /workspace
 
-# The dictionary first, in its own layers: Docker reuses them until JMdict_english.zip or
-# the packer changes, so a code change no longer repacks the 25 MB dictionary (~12 s).
-# (A missing .cache/JMdict_english.zip fails this COPY loudly: run tools/fetch_assets.py.)
-COPY .cache/JMdict_english.zip tools/dict_packer.py /dict_src/
+# The dictionary first, in its own layers: Docker reuses them until JMdict_english.zip, the
+# Jiten frequency list or the packer changes, so a code change no longer repacks the 25 MB
+# dictionary (~12 s). Jiten ranks the entries the way Hoshi Reader does (行った: 行く before 行う).
+# (A missing .cache/*.zip fails this COPY loudly: run tools/fetch_assets.py.)
+COPY .cache/JMdict_english.zip .cache/jiten_freq_global.zip tools/dict_packer.py /dict_src/
 RUN mkdir -p /workspace/release && \
-    python3 /dict_src/dict_packer.py /dict_src/JMdict_english.zip -o /workspace/release/dict.bin
+    python3 /dict_src/dict_packer.py /dict_src/JMdict_english.zip /dict_src/jiten_freq_global.zip \
+        -o /workspace/release/dict.bin
 
 # Copy repository source code
 COPY . /workspace

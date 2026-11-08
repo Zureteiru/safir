@@ -16,8 +16,8 @@ Safir is inspired by [Rubi for Vita](https://github.com/bee-san/Rubi_for_vita), 
 1. **Screenshot.** You press ZL+ZR. Safir takes a screenshot of the game with the system's own screenshot service, without drawing anything over it first.
 2. **Find the lines.** It finds the text lines: first at half resolution over the whole screen, then each line again at full resolution so small text stays sharp.
 3. **Read the lines.** It reads each line with a small Japanese OCR network (VOCR6.2, int8) on the console's CPU, which takes about half a second for a typical dialogue box.
-4. **Split into words.** It splits the text into dictionary words: longest match first, with deinflection, so 食べさせられた finds 食べる.
-5. **Look up.** It shows a popup next to the word you pick, with readings and English meanings from JMdict.
+4. **Split into words.** It splits the text into dictionary words: longest match first, with deinflection, so 食べさせられた finds 食べる. Deinflection uses Yomitan's rules, so the popup shows the same steps as Yomitan and Hoshi Reader (`causative › potential or passive › -た`).
+5. **Look up.** It shows a popup next to the word you pick, with readings and English meanings from JMdict. When a word has several matches, the more common one comes first, using the Jiten frequency list (行った: 行く before 行う).
 
 ## Requirements
 
@@ -87,7 +87,7 @@ These are real, current problems. Please report others in [Issues](../../issues)
 - **Per-game regions (`games.ini`) may not apply.** The running game's title ID isn't always detected. The overlay then scans the full screen, which works for most games.
 - **The Normal model needs about 6 MB of overlay memory.** At the default 4 MB, `auto` falls back to the Small model, which makes about twice as many mistakes.
 - **Memory is tight at 4 MB.** Very wide popups combined with the Normal model can run out of memory. Safir reports it instead of crashing, and lowering `popup_width` helps.
-- **English meanings only** (JMdict). No pitch accent, no frequency lists, no custom dictionaries yet.
+- **English meanings only** (JMdict). No pitch accent and no custom dictionaries yet. The Jiten frequency list only sorts the results; ranks aren't shown.
 - **Tested on one console and a handful of games.** Expect rough edges on other setups.
 - **No furigana handling.** Ruby text above a line can be read as noise or skipped.
 
@@ -96,7 +96,7 @@ These are real, current problems. Please report others in [Issues](../../issues)
 You need Docker (it provides the devkitPro Switch toolchain) and Python 3.
 
 ```bash
-python tools/fetch_assets.py   # OCR models + JMdict into .cache/ (SHA-256 checked)
+python tools/fetch_assets.py   # OCR models, JMdict and the Jiten frequency list into .cache/
 ```
 
 On Windows, build the overlay and the SD-card layout with:
@@ -127,5 +127,7 @@ The output goes to `dist/` (`safir.ovl`, `dict.bin`, the models) and, with the P
 - **[libtesla](https://github.com/WerWolv/libtesla)** (GPLv2 or later; a modified copy is in `libs/libtesla`).
 - **[picojpeg](https://github.com/richgel999/picojpeg)** by Rich Geldreich (public domain; modified copy in `libs/picojpeg`).
 - **[JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project)** by the Electronic Dictionary Research and Development Group, **CC BY-SA 4.0**. It's converted from the [jmdict-yomitan](https://github.com/yomidevs/jmdict-yomitan) export. `dict.bin` is a derived work under the same licence.
+- **[Jiten](https://jiten.moe)** frequency list (`jiten_freq_global.zip`), **CC BY-SA 4.0**. `dict.bin` uses its ranks to order the results.
+- **Deinflection rules** come from [Yomitan](https://github.com/yomidevs/yomitan)'s `japanese-transforms.js` (GPLv3), as [hoshidicts](https://github.com/Manhhao/hoshidicts) (GPLv3) builds them. They're in `core/dict/safir_deinflect_rules.h`.
 
 Safir isn't affiliated with Nintendo or any game publisher.

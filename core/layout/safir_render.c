@@ -426,8 +426,9 @@ void safir_fb_draw_popup_card(uint8_t *fb, uint16_t fb_w, uint16_t fb_h,
     safir_fb_draw_string(fb, fb_w, fb_h, pad_x, cur_y, lookup->headword, 255, 255, 255, 255, 2);
 
     /* 3. Frequency Pill Badge */
-    uint16_t freq_val = (lookup->freq_rank > 0) ? lookup->freq_rank : 1240;
-    safir_fb_draw_freq_badge(fb, fb_w, fb_h, (uint16_t)(popup_rect.x + popup_rect.w - 110), (uint16_t)(popup_rect.y + 14), freq_val);
+    /* Ranks of 30000 and up are words the frequency list does not have (tools/dict_packer.py). */
+    if (lookup->freq_rank > 0 && lookup->freq_rank < 30000)
+        safir_fb_draw_freq_badge(fb, fb_w, fb_h, (uint16_t)(popup_rect.x + popup_rect.w - 110), (uint16_t)(popup_rect.y + 14), lookup->freq_rank);
 
     cur_y += 30;
 
