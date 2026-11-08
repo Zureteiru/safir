@@ -176,6 +176,50 @@ static Result capture_jpeg(uint8_t *out_gray, SafirRect rect, ViLayerStack stack
 static char s_capture_diag[192] = "";
 static int s_good_attempt = -1; /* attempt that last succeeded; tried first next time */
 
+/* Stale screenshots (console 2026-11-08, events.log): after switching games, the first caps:sc JPEG was
+ * byte-identical to the previous scan's, taken five minutes earlier in the other game. A capture equal
+ * to the previous one is therefore taken again from the other layer stack after two frames. */
+static uint32_t s_prev_fp = 0;
+static size_t s_prev_size = 0;
+static char s_stale_note[96] = "";
+
+const char *safir_capture_stale_note(void) { return s_stale_note; }
+
+static uint32_t jpeg_fp(void) {
+    uint32_t fp = 2166136261u; /* FNV-1a, as main_ovl.cpp logs it */
+    for (size_t i = 0; i < s_jpeg_last_size; ++i) fp = (fp ^ s_jpeg_buf[i]) * 16777619u;
+    return fp;
+}
+
+/* After a successful JPEG capture on `stack`: retake an identical one from the other stack. */
+static void recapture_if_stale(uint8_t *out_gray, SafirRect rect, ViLayerStack stack) {
+    s_stale_note[0] = '\0';
+    if (!s_jpeg_last_size) return;
+    uint32_t fp = jpeg_fp();
+    size_t size = s_jpeg_last_size;
+    if (size == s_prev_size && fp == s_prev_fp) {
+        const ViLayerStack other = stack == ViLayerStack_Screenshot ? ViLayerStack_Default : ViLayerStack_Screenshot;
+        svcSleepThread(33000000LL); /* two frames */
+        Result rc = capture_jpeg(out_gray, rect, other, 1000000000ULL);
+        uint32_t fp2 = R_SUCCEEDED(rc) ? jpeg_fp() : 0;
+        if (R_SUCCEEDED(rc) && (s_jpeg_last_size != size || fp2 != fp)) {
+            snprintf(s_stale_note, sizeof(s_stale_note), "same as last (%08x): retaken from the %s stack, %08x",
+                     (unsigned)fp, other == ViLayerStack_Default ? "Default" : "Screenshot", (unsigned)fp2);
+            fp = fp2;
+            size = s_jpeg_last_size;
+        } else {
+            if (R_FAILED(rc)) (void)capture_jpeg(out_gray, rect, stack, 1000000000ULL); /* the buffer was overwritten */
+            snprintf(s_stale_note, sizeof(s_stale_note), "same as last (%08x): %s stack %s", (unsigned)fp,
+                     other == ViLayerStack_Default ? "Default" : "Screenshot",
+                     R_SUCCEEDED(rc) ? "gave the same picture (screen unchanged)" : "failed");
+            fp = s_jpeg_last_size ? jpeg_fp() : fp;
+            size = s_jpeg_last_size;
+        }
+    }
+    s_prev_fp = fp;
+    s_prev_size = size;
+}
+
 const char *safir_capture_last_diag(void) {
     return s_capture_diag;
 }
@@ -209,6 +253,7 @@ Result safir_capture_crop_grayscale(uint8_t *out_gray, SafirRect rect, u64 timeo
                                      : capture_once(out_gray, rect, attempts[i].stack, t);
         if (R_SUCCEEDED(rc)) {
             s_good_attempt = i;
+            if (attempts[i].jpeg) recapture_if_stale(out_gray, rect, attempts[i].stack);
             if (used < sizeof(s_capture_diag)) {
                 snprintf(s_capture_diag + used, sizeof(s_capture_diag) - used, "ok:%s", attempts[i].name);
             }

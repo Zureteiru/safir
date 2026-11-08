@@ -139,6 +139,10 @@ typedef struct {             /* a parsed blob; points into it, so keep the blob 
     vocr_gate gate;              /* the head gate, if the blob has one (gate.hidden != 0) */
     vocr_2level two;             /* the 'VOC2' trailer's two-level head, if the blob has one */
     vocr_attn attn;              /* the attention op, if the blob has one (attn.dim != 0) */
+    /* safir: split load (vocr_load_split): the head's arrays [hole_off, hole_off + hole_len) stay in the file;
+     * the head op's q, scale and bias are NULL and these are their offsets in the file. hole_len 0: a full load. */
+    uint32_t hole_off, hole_len;
+    uint32_t head_w_off, head_s_off, head_b_off;
 } vocr_model;
 
 /* vocr_opts.head_gate */
@@ -213,6 +217,12 @@ typedef struct {             /* optional per-line extras for vocr_run() */
     float *esc_score;        /* in: cap_frames floats: each frame's two-level escape score (two_level on; a
                                 frame the gate skipped gets none) */
     unsigned escaped;        /* out: frames the two-level escape fired on (0 with the full head) */
+    /* safir: body only. no_head != 0 (W8I, no gate, topk 0, logits NULL) skips the head and writes each frame's
+     * head input as the head quantises it: head_q16 (cap_frames x K int16) and head_s16 (cap_frames floats).
+     * text stays empty; vocr_head_block and vocr_head_decode finish the line. Required after vocr_load_split. */
+    unsigned no_head;
+    int16_t *head_q16;
+    float *head_s16;
 } vocr_extra;
 
 typedef struct {             /* per-op plan; private */
@@ -262,6 +272,23 @@ int vocr_preprocess(const vocr_model *m, const vocr_image *img, unsigned char *o
 /* UTF-8 bytes of class c, *len of them (not NUL-terminated; "" for the blank, class 0). */
 const char *vocr_class_text(const vocr_model *m, unsigned c, unsigned *len);
 const char *vocr_strerror(int rc);
+/* safir: streaming the output head from the file.
+ * vocr_head_span: from the blob's first n bytes (header and op table), the byte range [*off, *off + *len) of the
+ * head's arrays (int8 weights, scales, bias; 16-byte aligned) and the blob's bytes (*total). VOCR_E_MODE: the
+ * head is not int8 with a bias. */
+int vocr_head_span(const void *hdr, size_t n, uint32_t *off, uint32_t *len, uint32_t *total);
+/* Load a buffer holding the blob's bytes [0, hole_off) followed by [hole_off + hole_len, total) (no trailers). */
+int vocr_load_split(vocr_model *m, const void *blob, size_t bytes, uint32_t hole_off, uint32_t hole_len);
+/* The head over nf frames of int16 head input (vocr_extra.no_head), for its 8-row blocks [nb0, nb0 + nblk):
+ * q (nblk x K x 8 int8), scale and bias (nblk x 8 floats each) are those blocks' rows, as in the file. Updates
+ * each frame's best logit and class (start at -inf and 0) and with topk its K largest logits (start at -inf and 0),
+ * exactly as vocr_run's W8I head does when the blocks are given in increasing order. */
+int vocr_head_block(const vocr_model *m, const int16_t *qx, const float *sx, unsigned nf, const int8_t *q,
+                    const float *scale, const float *bias, unsigned nb0, unsigned nblk, float *bestv, uint16_t *besti,
+                    unsigned topk, float *topk_logit, uint16_t *topk_class);
+/* Greedy CTC over the classes vocr_head_block found: text, and in ex (may be NULL) chars, conf_min, conf_mean. */
+int vocr_head_decode(const vocr_model *m, const uint16_t *besti, unsigned nf, const float *topk_logit, unsigned topk,
+                     char *text, size_t text_cap, vocr_extra *ex);
 /* sizeof(vocr_model) and sizeof(vocr_ctx), for foreign-function bindings. */
 void vocr_sizes(size_t *model_bytes, size_t *ctx_bytes);
 

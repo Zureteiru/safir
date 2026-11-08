@@ -10,18 +10,18 @@ extern "C" {
 #endif
 
 /*
- * Memory Ledger Static Pool Budgets (total 1,180,000 bytes of .bss).
+ * Memory Ledger Static Pool Budgets (total 1,240,000 bytes; on the Switch POOL_OCR_WEIGHTS is attached, so 480,000 B of .bss).
  *
  * POOL_OCR_WEIGHTS holds the whole VOCR6.2_S_w8.vocr blob, which the real recognizer
  * (libs/vocr/vocr.c) reads in place: 819,792 B blob + ~22 KB backend/context state.
  * The earlier 2345-0002 failures happened at 2.25-4.5 MB of .bss; a 584 KB build booted.
  */
-#define SAFIR_POOL_OCR_WEIGHTS_MAX_BYTES    860000ULL /* 860 KB: VOCR6.2 blob (819,792 B) + backend/context */
-#define SAFIR_POOL_OCR_SCRATCH_MAX_BYTES    160000ULL /* 160 KB: 2x crop (<=57,750 B) + line finder (~17 KB) + VOCR arena (53,856 B) */
+#define SAFIR_POOL_OCR_WEIGHTS_MAX_BYTES    760000ULL /* host only: a streamed model (Normal 728 KB without its head) + backend; on the Switch it is attached */
+#define SAFIR_POOL_OCR_SCRATCH_MAX_BYTES    320000ULL /* 320 KB: textspot8 arena (305,247 B for the 640x360 pass-1 frame; a band's up to ~210 KB beside the 80 KB VOCR arena) */
 #define SAFIR_POOL_DICT_INDEX_MAX_BYTES     100000ULL /* 100 KB: Level-1 sparse anchors + block table when it fits */
 #define SAFIR_POOL_UI_STATE_MAX_BYTES        60000ULL /* 60 KB: 32 KB L2 page + 16 KB glossary block */
 
-#define SAFIR_TOTAL_BUDGET_MAX_BYTES       1180000ULL /* 1.18 MB total */
+#define SAFIR_TOTAL_BUDGET_MAX_BYTES       1240000ULL /* 1.24 MB total */
 
 typedef enum SafirPool {
     POOL_OCR_WEIGHTS = 0,

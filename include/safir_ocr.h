@@ -144,6 +144,31 @@ bool safir_ocr_vocr_load_file(SafirOcrBackend *backend, const char *filepath);
 void *safir_ocr_vocr_lend_weights(SafirOcrBackend *backend, size_t *bytes);
 bool safir_ocr_vocr_restore_weights(SafirOcrBackend *backend);
 
+/**
+ * Streamed output head (default on): safir_ocr_vocr_load_file keeps the model without its output
+ * head in memory and reads the head from the file once per batch of lines. Same results, about
+ * half the model memory. Set before loading.
+ */
+void safir_ocr_vocr_set_stream_head(bool on);
+/** POOL_OCR_WEIGHTS bytes the model file needs after the backend, as it would load now; 0 if unreadable. */
+size_t safir_ocr_vocr_weights_bytes(const char *path);
+/**
+ * Memory (16-byte aligned) for the next safir_ocr_vocr_load_file's model instead of POOL_OCR_WEIGHTS
+ * (NULL: the pool). The backend itself stays in the pool. lend_weights then lends all of it.
+ */
+void safir_ocr_vocr_set_model_memory(void *mem, size_t bytes);
+
+/**
+ * textspot8 line spotter: loads its blob (textspot8_t64n8c16_w8.vtsp, 52 KB) into POOL_OCR_WEIGHTS.
+ * Call after safir_ocr_vocr_create() (a new backend forgets it). While loaded and enabled it finds
+ * lines everywhere the classic finder did; the classic finder remains the fallback.
+ */
+bool safir_ocr_vocr_load_spotter(const char *path);
+bool safir_ocr_vocr_spotter_loaded(void);
+void safir_ocr_vocr_set_spotter_enabled(bool on);
+/** Calls the spotter answered, and calls that fell back to the classic finder, since start. */
+void safir_ocr_vocr_spotter_stats(unsigned *runs, unsigned *fallbacks);
+
 /* Two-pass scan of a JPEG screenshot (see safir_ocr_vocr.c). Pass 1 finds lines at half
  * resolution; pass 2 re-reads each line as its own band, at full resolution when small. */
 #define SAFIR_SCAN_MAX_BLOCKS 12

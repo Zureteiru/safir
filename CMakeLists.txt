@@ -28,7 +28,7 @@ if (SAFIR_TARGET STREQUAL "HOST")
 
     file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/core/*.c" "${CMAKE_CURRENT_SOURCE_DIR}/core/*.cpp")
     # Real VOCR6.2 recognizer, vendored from bee-san/vita-vn-ocr (GPLv3, libs/vocr/LICENSE)
-    set(VOCR_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines.c)
+    set(VOCR_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_textspot6.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines_rows.c)
     # Region-only JPEG decoding for caps:sc JPEG screenshots (public domain, libs/picojpeg)
     set(PICOJPEG_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/libs/picojpeg/picojpeg.c)
     if(MSVC)
@@ -145,7 +145,7 @@ elseif (SAFIR_TARGET STREQUAL "SWITCH")
     # In Switch mode, link with libnx and libtesla when building the .ovl
     file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/core/*.c" "${CMAKE_CURRENT_SOURCE_DIR}/core/*.cpp")
     # Real VOCR6.2 recognizer, vendored from bee-san/vita-vn-ocr (GPLv3, libs/vocr/LICENSE)
-    set(VOCR_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines.c)
+    set(VOCR_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_textspot6.c ${CMAKE_CURRENT_SOURCE_DIR}/libs/vocr/vocr_lines_rows.c)
     set_source_files_properties(${VOCR_SOURCES} PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     list(APPEND CORE_SOURCES ${VOCR_SOURCES})
     # Region-only JPEG decoding for caps:sc JPEG screenshots (public domain, libs/picojpeg)
@@ -201,7 +201,7 @@ elseif (SAFIR_TARGET STREQUAL "SWITCH")
 
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/safir.nacp
-        COMMAND ${NX_NACPTOOL_EXE} --create "Safir" "jenduis" "0.1.0" ${CMAKE_CURRENT_BINARY_DIR}/safir.nacp
+        COMMAND ${NX_NACPTOOL_EXE} --create "Safir" "jenduis" "0.2.0" ${CMAKE_CURRENT_BINARY_DIR}/safir.nacp
         COMMENT "Creating safir.nacp"
     )
 

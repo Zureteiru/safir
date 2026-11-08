@@ -95,6 +95,7 @@ namespace tsl {
         extern bool FloatingLayer;              ///< safir: with FullScreen, the layer is FullScreenFb* at 1:1 handheld pixels and can be moved (setLayerPos)
         extern u64 launchCombo;                 ///< Overlay activation key combo
         extern u64 extraLaunchCombo;            ///< safir: second combo that opens/hides this overlay (0 = none)
+        extern bool twoFingerLaunch;            ///< safir: a second finger on the touch screen opens/hides this overlay
 
     }
 
@@ -277,6 +278,20 @@ namespace tsl {
             } in = { stack, layer->layer_id };
 
             return serviceDispatchIn(viGetSession_IManagerDisplayService(), 6000, in);
+        }
+
+        /**
+         * @brief safir: shows or hides a layer (IManagerDisplayService SetLayerVisibility, cmd 6002;
+         *        libnx has no wrapper)
+         */
+        static Result viSetLayerVisibility(ViLayer *layer, bool visible) {
+            const struct {
+                u8 visible;
+                u8 pad[7];
+                u64 layerId;
+            } in = { (u8)(visible ? 1 : 0), {}, layer->layer_id };
+
+            return serviceDispatchIn(viGetSession_IManagerDisplayService(), 6002, in);
         }
 
         /**
@@ -974,6 +989,7 @@ namespace tsl {
             NWindow m_window;
             Framebuffer m_framebuffer;
             void *m_currentFramebuffer = nullptr;
+            bool m_lent = false; /* safir: framebuffers lent out (lendFramebuffers) */
 
             std::stack<ScissoringConfig> m_scissoringStack;
 
@@ -1056,6 +1072,40 @@ namespace tsl {
                     cfg::LayerPosX = x;
                     cfg::LayerPosY = y;
                 }
+            }
+
+            /**
+             * @brief safir: lends both framebuffers (one block) as scratch memory, e.g. for the OCR
+             *        model during a scan. Hides the layer and waits two vsyncs, so vi no longer
+             *        reads them. Nothing may draw until returnFramebuffers().
+             */
+            static void *lendFramebuffers(size_t *bytes) {
+                Renderer &r = Renderer::get();
+                *bytes = 0;
+                if (!r.m_initialized || r.m_lent || !r.m_framebuffer.buf)
+                    return nullptr;
+                if (R_FAILED(tsl::hlp::viSetLayerVisibility(&r.m_layer, false)))
+                    return nullptr;
+                r.waitForVSync();
+                r.waitForVSync();
+                r.m_lent = true;
+                *bytes = (size_t)r.m_framebuffer.fb_size * r.m_framebuffer.num_fbs;
+                return r.m_framebuffer.buf;
+            }
+
+            /**
+             * @brief safir: takes the framebuffers back: clears both to transparent (whatever vi
+             *        shows first is then empty), flushes them and shows the layer again.
+             */
+            static void returnFramebuffers() {
+                Renderer &r = Renderer::get();
+                if (!r.m_lent)
+                    return;
+                const size_t n = (size_t)r.m_framebuffer.fb_size * r.m_framebuffer.num_fbs;
+                std::memset(r.m_framebuffer.buf, 0, n);
+                armDCacheFlush(r.m_framebuffer.buf, n);
+                tsl::hlp::viSetLayerVisibility(&r.m_layer, true);
+                r.m_lent = false;
             }
 
         private:
@@ -3520,7 +3570,13 @@ namespace tsl {
                     const u64 extraCombo = tsl::cfg::extraLaunchCombo;
                     const bool mainComboHit = ((shData->keysHeld & tsl::cfg::launchCombo) == tsl::cfg::launchCombo) && shData->keysDown & tsl::cfg::launchCombo;
                     const bool extraComboHit = extraCombo != 0 && ((shData->keysHeld & extraCombo) == extraCombo) && (shData->keysDown & extraCombo);
-                    if (mainComboHit || extraComboHit) {
+                    /* safir: two fingers on the screen, for games that use the button combo themselves. It fires
+                     * once, when the second finger lands; lifting both fingers re-arms it. */
+                    static s32 s_prevTouches = 0;
+                    const s32 touches = shData->touchState.count;
+                    const bool touchHit = tsl::cfg::twoFingerLaunch && touches >= 2 && s_prevTouches < 2;
+                    s_prevTouches = touches;
+                    if (mainComboHit || extraComboHit || touchHit) {
                         if (shData->overlayOpen) {
                             tsl::Overlay::get()->hide();
                             shData->overlayOpen = false;
@@ -3702,6 +3758,7 @@ namespace tsl::cfg {
     bool FloatingLayer = false;
     u64 launchCombo = HidNpadButton_L | HidNpadButton_Down | HidNpadButton_StickR;
     u64 extraLaunchCombo = 0;
+    bool twoFingerLaunch = true;
 }
 
 extern "C" {

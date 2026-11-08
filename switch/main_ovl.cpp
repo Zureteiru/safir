@@ -118,7 +118,14 @@ static char s_ocr_model_path[96] = "";
 static const char *s_ocr_model_label = "none";
 static char s_ocr_model_note[192] = "";
 /* Backend and context next to the blob in the pool: 20.6 KB measured on the host. */
-static const size_t kOcrContextBytes = 32 * 1024;
+static const size_t kOcrContextBytes = (32 + 56) * 1024; /* backend + context + the 52 KB textspot8 blob */
+static const char *s_spotter_name = "textspot8_t64n8c16_w8.vtsp";
+static bool s_use_spotter = true; /* config.ini line_finder=textspot8 (default) | classic */
+/* config.ini share_popup_memory=1: no heap block for the model. During a scan the popup is hidden
+ * and its two framebuffers (0.5-1.2 MB) hold the screenshot JPEG and then the model; afterwards
+ * they are cleared and the popup is drawn again. Saves the whole model block. */
+static bool s_share_fb = false;
+static const size_t kJpegLendBytes = 512 * 1024; /* the caps:sc JPEG goes into the lent model memory */
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -309,6 +316,15 @@ static void load_ocr_model(void) {
                  safir_pool_capacity(POOL_OCR_WEIGHTS));
         return;
     }
+    /* The textspot8 line spotter (52 KB, next to the backend); without it the classic finder runs. */
+    bool spot_ok = false;
+    if (s_use_spotter) {
+        char sp[96];
+        for (size_t d = 0; d < ARRAY_LEN(s_asset_dirs) && !spot_ok; ++d) {
+            snprintf(sp, sizeof(sp), "%s%s", s_asset_dirs[d], s_spotter_name);
+            spot_ok = safir_ocr_vocr_load_spotter(sp);
+        }
+    }
     u64 t0 = armGetSystemTick();
     bool model_ok = safir_ocr_vocr_load_file(s_switch_ocr, path);
     s_ocr_load_ms = (u32)(armTicksToNs(armGetSystemTick() - t0) / 1000000ULL);
@@ -325,8 +341,9 @@ static void load_ocr_model(void) {
          * NEON path. Rebuild with -DVOCR_NO_NEON (see AUDIT) and report it. */
         snprintf(s_ocr_status, sizeof(s_ocr_status), "OCR WARN: self-test FAILED, results unreliable");
     } else {
-        snprintf(s_ocr_status, sizeof(s_ocr_status), "OCR OK: VOCR6.2 %s, self-test pass, %u ms", s_ocr_model_label,
-                 (unsigned)s_ocr_load_ms);
+        snprintf(s_ocr_status, sizeof(s_ocr_status), "OCR OK: VOCR6.2 %s, self-test pass, %u ms, lines: %s",
+                 s_ocr_model_label, (unsigned)s_ocr_load_ms,
+                 spot_ok ? "textspot8" : s_use_spotter ? "classic (textspot8 file missing)" : "classic");
     }
 }
 
@@ -426,6 +443,40 @@ static bool find_model_file(const char *const *names, size_t n_names, char *path
     return false;
 }
 
+/* share_popup_memory=1, after choose_popup_size: Normal when the framebuffers hold it (and the
+ * JPEG), else Small. */
+static void choose_shared_model(void) {
+    if (!s_share_fb) return;
+    const size_t fb = framebuffer_cost(tsl::cfg::FullScreenFbWidth, tsl::cfg::FullScreenFbHeight);
+    char npath[96], spath[96];
+    size_t nbytes = 0, sbytes = 0;
+    bool have_n = s_ocr_model_pref != OCR_MODEL_SMALL &&
+                  find_model_file(s_ocr_normal_names, ARRAY_LEN(s_ocr_normal_names), npath, sizeof(npath), &nbytes);
+    bool have_s = find_model_file(s_ocr_names, ARRAY_LEN(s_ocr_names), spath, sizeof(spath), &sbytes);
+    size_t need_n = have_n ? safir_ocr_vocr_weights_bytes(npath) : 0;
+    size_t need_s = have_s ? safir_ocr_vocr_weights_bytes(spath) : 0;
+    if (need_n && need_n < kJpegLendBytes) need_n = kJpegLendBytes;
+    if (need_s && need_s < kJpegLendBytes) need_s = kJpegLendBytes;
+    const char *path = nullptr, *label = "none";
+    size_t need = 0;
+    if (need_n && (s_ocr_model_pref == OCR_MODEL_NORMAL || need_n <= fb)) {
+        path = npath; label = "Normal"; need = need_n;
+    } else if (need_s && need_s <= fb) {
+        path = spath; label = "Small"; need = need_s;
+    }
+    if (!path) {
+        s_ocr_model_path[0] = '\0';
+        snprintf(s_ocr_model_note, sizeof(s_ocr_model_note),
+                 "no OCR model fits the popup's %zu KB (share_popup_memory=1: use a wider popup)", fb / 1024);
+        return;
+    }
+    copy_utf8_trunc(s_ocr_model_path, sizeof(s_ocr_model_path), path);
+    s_ocr_model_label = label;
+    snprintf(s_ocr_model_note, sizeof(s_ocr_model_note),
+             "OCR model %s (%zu KB during scans, in the popup's %zu KB; share_popup_memory=1)", label, need / 1024,
+             fb / 1024);
+}
+
 /* Runs in initServices FIRST, before every other long-lived block and the framebuffers:
  * takes one heap block sized to the chosen model and hands it to POOL_OCR_WEIGHTS, so the
  * model never fragments the heap and .bss holds no model memory at all.
@@ -434,11 +485,29 @@ static bool find_model_file(const char *const *names, size_t n_names, char *path
  * counts them); otherwise Small. normal takes Normal whenever it can be allocated (the
  * popup then shrinks to what is left). */
 static void choose_ocr_model(size_t later_blocks) {
+    if (s_share_fb) {
+        /* The model goes into the framebuffers during scans (choose_shared_model picks it once the
+         * popup size is known); only the backend and its context need heap. */
+        void *mem = aligned_alloc(16, kOcrContextBytes);
+        if (mem && safir_pool_attach(POOL_OCR_WEIGHTS, mem, kOcrContextBytes)) return;
+        free(mem);
+        s_share_fb = false; /* fall back to a model block on the heap */
+    }
     char npath[96], spath[96];
     size_t nbytes = 0, sbytes = 0;
     bool have_n = s_ocr_model_pref != OCR_MODEL_SMALL &&
                   find_model_file(s_ocr_normal_names, ARRAY_LEN(s_ocr_normal_names), npath, sizeof(npath), &nbytes);
     bool have_s = find_model_file(s_ocr_names, ARRAY_LEN(s_ocr_names), spath, sizeof(spath), &sbytes);
+    /* What the model really takes: without its output head (streamed from the SD card, about half
+     * the file), but at least the screenshot JPEG that is written into the same memory. */
+    if (have_n) {
+        size_t w = safir_ocr_vocr_weights_bytes(npath);
+        if (w) nbytes = w < kJpegLendBytes ? kJpegLendBytes : w;
+    }
+    if (have_s) {
+        size_t w = safir_ocr_vocr_weights_bytes(spath);
+        if (w) sbytes = w < kJpegLendBytes ? kJpegLendBytes : w;
+    }
     const size_t free0 = largest_free_block();
     const size_t after = later_blocks + framebuffer_cost(640, 384) + kCaptureBlockBytes + 416 * 1024;
     const char *why = "";
@@ -511,7 +580,7 @@ static void release_capture_buffers(void) {
 static void load_assets_if_needed(void) {
     safir_engine_lock();
     if (!s_dict_loaded) load_dictionary();
-    if (!s_ocr_loaded) load_ocr_model();
+    if (!s_ocr_loaded && !s_share_fb) load_ocr_model(); /* shared: only inside a scan */
     s_assets_probed = true;
     safir_engine_unlock();
 }
@@ -604,8 +673,34 @@ static void run_scan_now_inner(void);
 
 static void start_scan_after(int frames);
 
-/* Runs on the UI thread after the layer has been transparent for a few frames. */
+static void run_scan_now_body(void);
+
+/* Runs on the UI thread after the layer has been transparent for a few frames. With
+ * share_popup_memory=1 the popup's framebuffers are the model memory for the scan's length. */
 static void run_scan_now(void) {
+    if (!s_share_fb) {
+        run_scan_now_body();
+        return;
+    }
+    size_t fb_bytes = 0;
+    void *fb = tsl::gfx::Renderer::lendFramebuffers(&fb_bytes);
+    if (!fb) {
+        set_pill("Could not borrow the popup memory for the scan");
+        snprintf(s_detail, sizeof(s_detail), "Set share_popup_memory=0 in sdmc:/config/safir/config.ini.");
+        return;
+    }
+    safir_ocr_vocr_set_model_memory(fb, fb_bytes);
+    run_scan_now_body();
+    /* The drawing about to reuse this memory must not be read as a model: mark it lent; the
+     * next scan re-reads the model from the SD card, as after every screenshot. */
+    if (s_switch_ocr && s_ocr_loaded) {
+        size_t dummy = 0;
+        (void)safir_ocr_vocr_lend_weights(s_switch_ocr, &dummy);
+    }
+    tsl::gfx::Renderer::returnFramebuffers();
+}
+
+static void run_scan_now_body(void) {
     load_assets_if_needed();
     release_scan_state();
     s_detail[0] = '\0';
@@ -694,6 +789,7 @@ static void run_scan_now_inner(void) {
         } else {
             evlog("scan #%u: screenshot %zu B, fingerprint %08x", (unsigned)s_scan_no, jpeg_size, (unsigned)fp);
         }
+        if (safir_capture_stale_note()[0]) evlog("scan #%u: screenshot %s", (unsigned)s_scan_no, safir_capture_stale_note());
         size_t cap = (crop_gray == s_capture_block) ? kFrameCropBytes : num_pixels;
         plan_rc = safir_scan_prepare(jpeg, jpeg_size, rect, crop_gray, cap, true, &plan);
         /* A plan that failed part-way may have overwritten the half-resolution frame:
@@ -778,6 +874,9 @@ static void load_scan_combo(void) {
             if (key == "ocr_model") {
                 s_ocr_model_pref = val == "small" ? OCR_MODEL_SMALL : val == "normal" ? OCR_MODEL_NORMAL : OCR_MODEL_AUTO;
             }
+            if (key == "share_popup_memory") s_share_fb = (val == "1" || val == "on" || val == "true");
+            if (key == "line_finder") s_use_spotter = (val != "classic");
+            if (key == "touch_scan") tsl::cfg::twoFingerLaunch = !(val == "0" || val == "off" || val == "false");
             if (key == "popup_width") {
                 int wpx = atoi(val.c_str());
                 if (wpx >= 480 && wpx <= 1024) s_forced_popup_width = wpx & ~15;
@@ -796,8 +895,15 @@ static void load_scan_combo(void) {
                        "; The popup is drawn 1:1 (sharp); 384 px tall. 640 = 0.98 MB, 768 = 1.18 MB.\n"
                        "popup_width=auto\n"
                        "; OCR model: auto (Normal when the overlay memory has room, else Small), small or normal.\n"
-                       "; Normal (VOCR6.2_N_w8g2.vocr) makes about half the mistakes and needs ~370 KB more memory.\n"
+                       "; Normal (VOCR6.2_N_w8g2.vocr) makes about half the mistakes and needs ~220 KB more memory.\n"
                        "ocr_model=auto\n"
+                       "; 1: the OCR model borrows the popup's memory during a scan instead of its own (saves\n"
+                       "; ~0.6-1.2 MB; the popup is hidden while scanning). Experimental.\n"
+                       "share_popup_memory=0\n"
+                       "; Line finder: textspot8 (learned spotter, reads small two-line panels) or classic.\n"
+                       "line_finder=textspot8\n"
+                       "; 1: touching the screen with two fingers also opens Safir and scans (for games that use ZL+ZR).\n"
+                       "touch_scan=1\n"
                        "; 1: keep each scan's screenshot as scan_1..4.jpg in sdmc:/switch/safir/ (for bug reports).\n"
                        "save_scans=0\n", kDefaultScanCombo);
             fclose(f);
@@ -1430,6 +1536,7 @@ public:
             else { free(slots); free(arena); } /* the small built-in storage stays */
         }
         choose_popup_size();          /* then the widest popup layer that still fits */
+        choose_shared_model();        /* share_popup_memory=1: the model that fits in it */
 
         safir_ledger_init();
 

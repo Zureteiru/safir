@@ -85,6 +85,8 @@ RUN set -e; test -f /workspace/release/dict.bin && \
     else echo "ERROR: VOCR6.2_S_w8.vocr not found in .cache/models/ (run tools/fetch_assets.py)" >&2; exit 1; fi && \
     if [ -f .cache/models/VOCR6.2_N_w8g2.vocr ]; then cp -f .cache/models/VOCR6.2_N_w8g2.vocr /workspace/release/; \
     else echo "ERROR: VOCR6.2_N_w8g2.vocr not found in .cache/models/ (bee-san/vita-vn-ocr v0.5.0)" >&2; exit 1; fi && \
+    if [ -f .cache/models/textspot8_t64n8c16_w8.vtsp ]; then cp -f .cache/models/textspot8_t64n8c16_w8.vtsp /workspace/release/; \
+    else echo "ERROR: textspot8_t64n8c16_w8.vtsp not found in .cache/models/ (run tools/fetch_assets.py)" >&2; exit 1; fi && \
     echo "=== release artifacts ===" && ls -l /workspace/release
 
 # Default entrypoint: export artifacts to /dist (never touches anything else in /dist)

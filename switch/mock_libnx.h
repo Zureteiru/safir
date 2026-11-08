@@ -20,6 +20,9 @@ const char *safir_capture_last_diag(void);
 void safir_capture_set_jpeg_buffer(void *buf, size_t size);
 /* The JPEG of the last successful JPEG capture (valid until the next capture). */
 bool safir_capture_last_jpeg(const uint8_t **data, size_t *size);
+/* What the last capture did about a screenshot byte-identical to the one before (caps:sc can hand back
+ * a cached frame, e.g. the first capture after switching games): "" when it was a new picture. */
+const char *safir_capture_stale_note(void);
 #define capsscCaptureRawImageWithTimeout safir_switch_capture_crop
 
 #ifdef __cplusplus

@@ -7,6 +7,7 @@ pinned SHA-256.
 
   .cache/models/VOCR6.2_S_w8.vocr     Small OCR model  (bee-san/vita-vn-ocr v0.5.0)
   .cache/models/VOCR6.2_N_w8g2.vocr   Normal OCR model (bee-san/vita-vn-ocr v0.5.0)
+  .cache/models/textspot8_t64n8c16_w8.vtsp  Text line spotter (bee-san/vita-vn-ocr v0.3.10-textspot8.1)
   .cache/JMdict_english.zip           JMdict in Yomitan format (yomidevs/jmdict-yomitan)
   .cache/jiten_freq_global.zip        Jiten frequency list (jiten.moe): ranks the JMdict entries
 
@@ -33,6 +34,9 @@ ASSETS = [
      "864bbd196d5bc5d3a7bd7918cf7274b3503dfe65d440017ef0781ea7e7ba37d2"),
     (".cache/models/VOCR6.2_N_w8g2.vocr", VOCR + "VOCR6.2_N_w8g2.vocr",
      "107cf084cc0c1a3a61ce4c3f9b9cf6b31d6dff80f0a1bdb94afd3f7ee9ae3bc9"),
+    (".cache/models/textspot8_t64n8c16_w8.vtsp",
+     "https://github.com/bee-san/vita-vn-ocr/releases/download/v0.3.10-textspot8.1/textspot8_t64n8c16_w8.vtsp",
+     "e129d41adfa02c658a7d13d6f98064e6ab6ce9a2bc8c7a56da700a21357b5e1c"),
     (".cache/JMdict_english.zip", JMDICT + "JMdict_english.zip",
      "bb27b6b1e86ad86abf658dee09aeabe169674feb94213cbf112db23f6baa2ea7"),
     # Newest list, no pin (Jiten 26-10-02 was 85aab4fb7641a908c2560f30286c22e39448623dbcde8a592fbb86bcd8a272a8).

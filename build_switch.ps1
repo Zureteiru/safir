@@ -27,7 +27,7 @@ if ($LASTEXITCODE -ne 0) {
 $updated = @(docker run --rm -v "${PWD}/dist:/dist" safir 2>$null | Where-Object { $_ -like "updated: *" } |
     ForEach-Object { $_.Substring(9) })
 if ($LASTEXITCODE -ne 0) { Write-Host "== BUILD: FAIL (docker run export)" -ForegroundColor Red; exit 1 }
-$missing = @("safir.ovl", "safir.elf", "dict.bin", "VOCR6.2_S_w8.vocr", "VOCR6.2_N_w8g2.vocr") |
+$missing = @("safir.ovl", "safir.elf", "dict.bin", "VOCR6.2_S_w8.vocr", "VOCR6.2_N_w8g2.vocr", "textspot8_t64n8c16_w8.vtsp") |
     Where-Object { -not (Test-Path (Join-Path "dist" $_)) }
 if ($missing) { Write-Host "== BUILD: FAIL, missing in dist: $($missing -join ', ')" -ForegroundColor Red; exit 1 }
 

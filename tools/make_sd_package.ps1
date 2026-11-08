@@ -1,6 +1,6 @@
 # make_sd_package.ps1 - lays out everything safir needs on the SD card, ready to copy in one go:
 #   sd_package\switch\.overlays\safir.ovl
-#   sd_package\switch\safir\dict.bin, VOCR6.2_S_w8.vocr, VOCR6.2_N_w8g2.vocr
+#   sd_package\switch\safir\dict.bin, VOCR6.2_S_w8.vocr, VOCR6.2_N_w8g2.vocr, textspot8_t64n8c16_w8.vtsp
 #   sd_package\config\safir\config.ini   (every option)
 # Copy the config and switch folders in sd_package onto the SD card root, replacing existing
 # files. Only files whose contents changed are rewritten, so timestamps show what is new.
@@ -10,7 +10,7 @@ param([switch]$Quiet) # -Quiet: no file list (build_switch.ps1 prints its own su
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-foreach ($f in "dist\safir.ovl", "dist\dict.bin", "dist\VOCR6.2_S_w8.vocr", "dist\VOCR6.2_N_w8g2.vocr") {
+foreach ($f in "dist\safir.ovl", "dist\dict.bin", "dist\VOCR6.2_S_w8.vocr", "dist\VOCR6.2_N_w8g2.vocr", "dist\textspot8_t64n8c16_w8.vtsp") {
     if (-not (Test-Path $f)) { Write-Host "MISSING: $f (run build_switch.ps1 first)" -ForegroundColor Red; exit 1 }
 }
 
@@ -29,6 +29,7 @@ Sync-File dist\safir.ovl "$pkg\switch\.overlays\safir.ovl"
 Sync-File dist\dict.bin "$pkg\switch\safir\dict.bin"
 Sync-File dist\VOCR6.2_S_w8.vocr "$pkg\switch\safir\VOCR6.2_S_w8.vocr"
 Sync-File dist\VOCR6.2_N_w8g2.vocr "$pkg\switch\safir\VOCR6.2_N_w8g2.vocr"
+Sync-File dist\textspot8_t64n8c16_w8.vtsp "$pkg\switch\safir\textspot8_t64n8c16_w8.vtsp"
 
 $config = @"
 [safir]
@@ -39,8 +40,15 @@ scan_combo=ZL+ZR
 ; The popup is drawn 1:1 (sharp); 384 px tall. 640 = 0.98 MB, 768 = 1.18 MB.
 popup_width=auto
 ; OCR model: auto (Normal when the overlay memory has room, else Small), small or normal.
-; Normal (VOCR6.2_N_w8g2.vocr) makes about half the mistakes and needs ~370 KB more memory.
+; Normal (VOCR6.2_N_w8g2.vocr) makes about half the mistakes and needs ~220 KB more memory.
 ocr_model=auto
+; Line finder: textspot8 (trained spotter, reads small two-line panels) or classic.
+line_finder=textspot8
+; 1: touching the screen with two fingers also opens Safir and scans (for games that use ZL+ZR).
+touch_scan=1
+; 1: the OCR model borrows the popup's memory during a scan instead of its own (saves
+; ~0.4-0.7 MB; the popup is hidden while scanning). Experimental.
+share_popup_memory=0
 ; 1: keep each scan's screenshot as scan_1..4.jpg in sdmc:/switch/safir/ (for bug reports).
 save_scans=0
 

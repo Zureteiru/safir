@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "vocr.h"
 #include "vocr_lines.h"
+#include "vocr_textspot6.h"
 #include "safir_ocr_selftest.h"
 
 #if defined(__aarch64__)
@@ -200,6 +201,18 @@ typedef struct SafirVocrContext {
     size_t blob_bytes;
     char blob_path[128];
     bool lent;
+    /* Streamed output head (safir_ocr_vocr_set_stream_head): blob holds the model without the head's
+     * arrays, which are read from blob_path in chunks once per batch of lines (half the model's RAM). */
+    bool split;
+    uint32_t hole_off, hole_len, total;
+    uint8_t *chunk;            /* one chunk of head rows: int8 weights, scales, biases */
+    unsigned chunk_blocks;     /* 8-row blocks per chunk */
+    uint8_t *queue;            /* head input and head results for a batch of lines */
+    unsigned queue_frames;
+    size_t lend_bytes;         /* blob .. end of queue: what safir_ocr_vocr_lend_weights lends */
+    uint8_t *ext;              /* caller's model memory (safir_ocr_vocr_set_model_memory), or NULL */
+    size_t ext_cap, ext_used;
+    struct LineBatch *batch;   /* lines waiting for the head (during a scan) */
 } SafirVocrContext;
 
 /* Arithmetic and tiling for the real engine: int8 weights with exact int32 sums,
@@ -216,6 +229,96 @@ static void real_engine_opts(vocr_opts *o) {
  * topology; unlike GRAD it isolates dialogue lines on a full 1280x720 frame instead of
  * merging the background art into one block. */
 static int s_line_finder = VOCR_LINES_TEXTBOX;
+
+/* ---- textspot8 line spotter (libs/vocr/vocr_textspot6.c) ---------------- */
+/* vita-vn-ocr's learned dialogue-line spotter (52 KB int8, docs/textspot8.md upstream), used in place of the
+ * classic finder wherever lines are found; the classic finder stays as the fallback (no spotter loaded, no
+ * memory for its arena, an error, or no horizontal line found). Its boxes come padded as the recognizer's
+ * training crops are, like the classic finder's. The blob lives in POOL_OCR_WEIGHTS, so creating a backend
+ * (which follows every pool reset) forgets it. */
+static bool s_scan_debug = false; /* host diagnostics (safir_scan_set_debug) */
+static vocr_textspot6 s_spot;
+static bool s_spot_ok = false;
+static bool s_spot_enabled = true;
+static unsigned s_spot_runs = 0, s_spot_fallbacks = 0;
+
+void safir_ocr_vocr_set_spotter_enabled(bool on) { s_spot_enabled = on; }
+bool safir_ocr_vocr_spotter_loaded(void) { return s_spot_ok; }
+void safir_ocr_vocr_spotter_stats(unsigned *runs, unsigned *fallbacks) {
+    if (runs) *runs = s_spot_runs;
+    if (fallbacks) *fallbacks = s_spot_fallbacks;
+}
+
+bool safir_ocr_vocr_load_spotter(const char *path) {
+    s_spot_ok = false;
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) return false;
+    long n = -1;
+    if (fseek(f, 0, SEEK_END) == 0) n = ftell(f);
+    if (n <= 0 || n > 256 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    void *blob = safir_alloc(POOL_OCR_WEIGHTS, (size_t)n);
+    bool ok = blob && fread(blob, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    ok = ok && vocr_textspot6_load(&s_spot, blob, (size_t)n) == VOCR_LINES_OK;
+    s_spot_ok = ok;
+    return ok;
+}
+
+/* Lines of li, top to bottom. scale_flag: VOCR_TEXTSPOT6_SCALE1 for an image at half the screen's resolution,
+ * VOCR_TEXTSPOT6_SCALE2 for one at full resolution (the spotter then sees text at the scale it was trained on:
+ * a console frame halved). The arena comes from POOL_OCR_SCRATCH and is released before returning. */
+static int find_lines(const VocrLinesImage *li, unsigned scale_flag, VocrLineSet *out) {
+    static VocrTextspot6Set ts; /* 1.7 KB: off the overlay's small stack */
+    memset(out, 0, sizeof(*out));
+    const size_t mark = safir_pool_used(POOL_OCR_SCRATCH);
+    if (s_spot_ok && s_spot_enabled) {
+        const size_t need = vocr_textspot6_arena_bytes_flags(&s_spot, li->width, li->height, scale_flag);
+        void *ar = need ? safir_alloc(POOL_OCR_SCRATCH, need) : NULL;
+        if (s_scan_debug)
+            fprintf(stderr, "  spotter %ux%u scale%u: arena %zu B, scratch free %zu B%s\n", li->width, li->height,
+                    scale_flag == VOCR_TEXTSPOT6_SCALE2 ? 2u : 1u, need,
+                    safir_pool_capacity(POOL_OCR_SCRATCH) - mark, ar ? "" : " (no room: classic finder)");
+        if (ar) {
+            int rc = vocr_textspot6_find(&s_spot, li, scale_flag, ar, need, &ts);
+            safir_pool_rewind(POOL_OCR_SCRATCH, mark);
+            if (s_scan_debug) fprintf(stderr, "  spotter rc=%d boxes=%u\n", rc, ts.count);
+            if (rc == VOCR_LINES_OK) {
+                for (unsigned i = 0; i < ts.count && out->count < VOCR_LINES_MAX; ++i) {
+                    const VocrTextspot6Box *b = &ts.boxes[i];
+                    if (b->vertical) continue; /* vertical columns: the recognizer reads lines only */
+                    VocrLine *L = &out->lines[out->count++];
+                    L->x = b->x;
+                    L->y = b->y;
+                    L->w = b->w;
+                    L->h = b->h;
+                    L->dark = b->dark;
+                }
+                out->truncated = ts.truncated;
+                for (unsigned i = 1; i < out->count; ++i) /* top to bottom, as the classic finder returns them */
+                    for (unsigned j = i; j > 0 && out->lines[j].y < out->lines[j - 1].y; --j) {
+                        VocrLine t = out->lines[j];
+                        out->lines[j] = out->lines[j - 1];
+                        out->lines[j - 1] = t;
+                    }
+                if (out->count > 0) {
+                    s_spot_runs++;
+                    return VOCR_LINES_OK;
+                }
+            }
+        }
+        s_spot_fallbacks++;
+        memset(out, 0, sizeof(*out));
+    }
+    const size_t need = vocr_lines_arena_bytes(li->width, li->height);
+    void *ar = safir_alloc(POOL_OCR_SCRATCH, need);
+    if (!ar) return VOCR_LINES_E_ARG;
+    int rc = vocr_find_lines(li, s_line_finder, ar, need, out);
+    safir_pool_rewind(POOL_OCR_SCRATCH, mark);
+    return rc;
+}
 
 void safir_ocr_vocr_set_line_finder(int finder) {
     s_line_finder = finder;
@@ -263,6 +366,146 @@ static bool real_recognize_line(SafirVocrContext *ctx, vocr_ctx *vc, const uint8
                                 char *text, size_t text_cap, uint16_t *best, unsigned *frames,
                                 unsigned *resized_w, float *conf);
 
+/* ---- Streamed output head ------------------------------------------------ */
+/* The head (5,631 classes x 96 int8 + scales + biases: 572 KB of the 1.16 MB Normal model) only runs once
+ * the body has produced every frame, so it is read from the file in STREAM_CHUNK_BYTES pieces for each
+ * batch of lines instead of living in RAM. vocr_head_block gives the same bits as the in-memory head. */
+#define STREAM_CHUNK_BYTES (48u * 1024u)           /* int8 head rows per read */
+#define STREAM_QUEUE_FRAMES (2u * REAL_MAX_FRAMES) /* frames of head input per batch (>= one line) */
+#define STREAM_TOPK 4u
+static bool s_stream_head = true;
+static unsigned char s_hdr[4096]; /* header and op table of a model file */
+
+void safir_ocr_vocr_set_stream_head(bool on) { s_stream_head = on; }
+
+/* Model memory outside POOL_OCR_WEIGHTS (the Switch lends the popup's framebuffers during a scan). */
+static uint8_t *s_ext_mem = NULL;
+static size_t s_ext_cap = 0;
+void safir_ocr_vocr_set_model_memory(void *mem, size_t bytes) {
+    s_ext_mem = (uint8_t *)mem;
+    s_ext_cap = mem ? bytes : 0;
+}
+
+/* The blob, chunk and queue: from the caller's memory when set, else POOL_OCR_WEIGHTS (16-byte aligned). */
+static void *model_alloc(SafirVocrContext *ctx, size_t n) {
+    if (!ctx->ext) return safir_alloc(POOL_OCR_WEIGHTS, n);
+    size_t at = (ctx->ext_used + 15u) & ~(size_t)15u;
+    if (at > ctx->ext_cap || n > ctx->ext_cap - at) return NULL;
+    ctx->ext_used = at + n;
+    return ctx->ext + at;
+}
+
+typedef struct QueueView {
+    int16_t *q16;
+    float *s16, *bestv, *tl;
+    uint16_t *besti, *tc;
+} QueueView;
+
+static size_t a16(size_t n) { return (n + 15u) & ~(size_t)15u; }
+
+static size_t queue_bytes(unsigned K, unsigned frames) {
+    return a16((size_t)frames * K * 2u) + 2u * a16((size_t)frames * 4u) + a16((size_t)frames * 2u) +
+           a16((size_t)frames * STREAM_TOPK * 4u) + a16((size_t)frames * STREAM_TOPK * 2u);
+}
+
+static QueueView queue_view(const SafirVocrContext *ctx) {
+    const unsigned K = ctx->vm.op[ctx->vm.n_ops - 1].k, F = ctx->queue_frames;
+    uint8_t *p = ctx->queue;
+    QueueView v;
+    v.q16 = (int16_t *)(void *)p;
+    p += a16((size_t)F * K * 2u);
+    v.s16 = (float *)(void *)p;
+    p += a16((size_t)F * 4u);
+    v.bestv = (float *)(void *)p;
+    p += a16((size_t)F * 4u);
+    v.besti = (uint16_t *)(void *)p;
+    p += a16((size_t)F * 2u);
+    v.tl = (float *)(void *)p;
+    p += a16((size_t)F * STREAM_TOPK * 4u);
+    v.tc = (uint16_t *)(void *)p;
+    return v;
+}
+
+static size_t chunk_bytes(unsigned K, unsigned blocks) {
+    return a16((size_t)blocks * K * 8u) + 2u * (size_t)blocks * 32u;
+}
+
+static uint32_t hdr32(const unsigned char *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* The head's input width K from a model header in s_hdr (vocr_head_span checked the op table fits). */
+static unsigned hdr_head_k(void) {
+    const unsigned char *r = s_hdr + hdr32(s_hdr + 28) + 64u * ((unsigned)(s_hdr[22] | s_hdr[23] << 8) - 1u);
+    return (unsigned)r[32] | (unsigned)r[33] << 8;
+}
+
+static unsigned chunk_blocks_for(unsigned K) {
+    unsigned blocks = K ? STREAM_CHUNK_BYTES / (K * 8u) : 0;
+    return blocks ? blocks : 1u;
+}
+
+/* Reads the model without its head: [0, hole_off) then [hole_off + hole_len, total). */
+static bool read_split(FILE *f, uint8_t *buf, uint32_t hole_off, uint32_t hole_len, uint32_t total) {
+    const size_t tail = (size_t)total - hole_off - hole_len;
+    if (fseek(f, 0, SEEK_SET) != 0 || fread(buf, 1, hole_off, f) != hole_off) return false;
+    if (fseek(f, (long)(hole_off + hole_len), SEEK_SET) != 0) return false;
+    return fread(buf + hole_off, 1, tail, f) == tail;
+}
+
+/* POOL_OCR_WEIGHTS bytes the model at path needs after the backend (blob, chunk and queue), or 0. */
+size_t safir_ocr_vocr_weights_bytes(const char *path) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) return 0;
+    size_t n = fread(s_hdr, 1, sizeof(s_hdr), f);
+    long fsize = -1;
+    if (fseek(f, 0, SEEK_END) == 0) fsize = ftell(f);
+    fclose(f);
+    if (fsize <= 80) return 0;
+    uint32_t off, len, total;
+    if (!s_stream_head || vocr_head_span(s_hdr, n, &off, &len, &total) != VOCR_OK || total > (uint32_t)fsize)
+        return (size_t)fsize + 64u;
+    const unsigned K = hdr_head_k();
+    if (!K) return (size_t)fsize + 64u;
+    return a16((size_t)total - len) + chunk_bytes(K, chunk_blocks_for(K)) + queue_bytes(K, STREAM_QUEUE_FRAMES) + 64u;
+}
+
+/* The head over the queue's first nf frames, streamed from the file chunk by chunk. */
+static bool head_pass(SafirVocrContext *ctx, unsigned nf) {
+    const vocr_model *m = &ctx->vm;
+    const unsigned K = m->op[m->n_ops - 1].k, NB = m->op[m->n_ops - 1].cout_pad / 8u, CB = ctx->chunk_blocks;
+    QueueView v = queue_view(ctx);
+    for (unsigned f = 0; f < nf; ++f) {
+        v.bestv[f] = -INFINITY;
+        v.besti[f] = 0;
+        for (unsigned j = 0; j < STREAM_TOPK; ++j) {
+            v.tl[f * STREAM_TOPK + j] = -INFINITY;
+            v.tc[f * STREAM_TOPK + j] = 0;
+        }
+    }
+    FILE *f = fopen(ctx->blob_path, "rb");
+    if (!f) {
+        OCR_ERR("head: fopen %s failed", ctx->blob_path);
+        return false;
+    }
+    int8_t *q = (int8_t *)(void *)ctx->chunk;
+    float *sc = (float *)(void *)(ctx->chunk + a16((size_t)CB * K * 8u));
+    float *bi = sc + (size_t)CB * 8u;
+    bool ok = true;
+    for (unsigned b0 = 0; b0 < NB && ok; b0 += CB) {
+        const unsigned nb = NB - b0 < CB ? NB - b0 : CB;
+        const size_t qn = (size_t)nb * K * 8u, sn = (size_t)nb * 32u;
+        ok = fseek(f, (long)(m->head_w_off + (size_t)b0 * K * 8u), SEEK_SET) == 0 && fread(q, 1, qn, f) == qn &&
+             fseek(f, (long)(m->head_s_off + (size_t)b0 * 32u), SEEK_SET) == 0 && fread(sc, 1, sn, f) == sn &&
+             fseek(f, (long)(m->head_b_off + (size_t)b0 * 32u), SEEK_SET) == 0 && fread(bi, 1, sn, f) == sn &&
+             vocr_head_block(m, v.q16, v.s16, nf, q, sc, bi, b0, nb, v.bestv, v.besti, STREAM_TOPK, v.tl,
+                             v.tc) == VOCR_OK;
+    }
+    fclose(f);
+    if (!ok) OCR_ERR("head: read or run failed (%s)", ctx->blob_path);
+    return ok;
+}
+
 /* Runs the embedded self-test line through the network. Catches a miscompiled
  * NEON path on the console before the user trusts the output. */
 static int run_selftest(SafirVocrContext *ctx) {
@@ -295,7 +538,8 @@ static int run_selftest(SafirVocrContext *ctx) {
 
 /* Parses a real VOCR blob that already sits 16-byte aligned in POOL_OCR_WEIGHTS. */
 static bool real_engine_load(SafirVocrContext *ctx, const void *blob, size_t bytes) {
-    int rc = vocr_load(&ctx->vm, blob, bytes);
+    int rc = ctx->split ? vocr_load_split(&ctx->vm, blob, bytes, ctx->hole_off, ctx->hole_len)
+                        : vocr_load(&ctx->vm, blob, bytes);
     if (rc != VOCR_OK) {
         OCR_ERR("vocr_load: %s (%d)", vocr_strerror(rc), rc);
         return false;
@@ -313,8 +557,9 @@ static bool real_engine_load(SafirVocrContext *ctx, const void *blob, size_t byt
     ctx->selftest = run_selftest(ctx);
     s_last_load_real = true;
     s_last_selftest = ctx->selftest;
-    OCR_ERR("ok: VOCR %u classes, h=%u, arena %zu B, self-test %s",
-            ctx->vm.n_classes, ctx->vm.height, need, ctx->selftest ? "PASS" : "FAIL");
+    OCR_ERR("ok: VOCR %u classes, h=%u, arena %zu B, %s, self-test %s",
+            ctx->vm.n_classes, ctx->vm.height, need, ctx->split ? "head streamed" : "head in RAM",
+            ctx->selftest ? "PASS" : "FAIL");
     return true;
 }
 
@@ -324,6 +569,7 @@ bool safir_ocr_vocr_load_binary(SafirOcrBackend *backend, const void *data, size
     }
     SafirVocrContext *ctx = (SafirVocrContext *)backend->userdata;
     SafirVocrModel *m = &ctx->model;
+    ctx->split = false; /* an in-memory blob keeps its head */
 
     const uint32_t *u32 = (const uint32_t *)data;
     if (u32[0] != VOCR_MAGIC) {
@@ -432,10 +678,63 @@ bool safir_ocr_vocr_load_file(SafirOcrBackend *backend, const char *filepath) {
         return false;
     }
 
+    SafirVocrContext *sctx = (SafirVocrContext *)backend->userdata;
+    sctx->split = false;
+    sctx->ext = ((uintptr_t)s_ext_mem & 15u) ? NULL : s_ext_mem;
+    sctx->ext_cap = sctx->ext ? s_ext_cap : 0;
+    sctx->ext_used = 0;
+    if (s_stream_head) {
+        /* Without the output head: it is read from the file per batch of lines (head_pass). */
+        size_t hn = fread(s_hdr, 1, sizeof(s_hdr), f);
+        uint32_t off, len, total;
+        if (vocr_head_span(s_hdr, hn, &off, &len, &total) == VOCR_OK && total <= (uint32_t)fsize && hdr_head_k()) {
+            const unsigned K = hdr_head_k(), blocks = chunk_blocks_for(K);
+            const size_t body = (size_t)total - len, cb = chunk_bytes(K, blocks),
+                         qb = queue_bytes(K, STREAM_QUEUE_FRAMES);
+            size_t free0 = safir_pool_capacity(POOL_OCR_WEIGHTS) - safir_pool_used(POOL_OCR_WEIGHTS);
+            if (sctx->ext) free0 = sctx->ext_cap;
+            uint8_t *sb = (uint8_t *)model_alloc(sctx, a16(body));
+            uint8_t *ch = sb ? (uint8_t *)model_alloc(sctx, cb) : NULL;
+            uint8_t *qu = ch ? (uint8_t *)model_alloc(sctx, qb) : NULL;
+            if (!qu) {
+                fclose(f);
+                OCR_ERR("POOL_OCR_WEIGHTS OOM: streamed model needs %zu B, free %zu B", a16(body) + cb + qb, free0);
+                return false;
+            }
+            bool rd_ok = read_split(f, sb, off, len, total);
+            fclose(f);
+            if (!rd_ok) {
+                OCR_ERR("short read of %s", filepath);
+                return false;
+            }
+            sctx->split = true;
+            sctx->hole_off = off;
+            sctx->hole_len = len;
+            sctx->total = total;
+            sctx->chunk = ch;
+            sctx->chunk_blocks = blocks;
+            sctx->queue = qu;
+            sctx->queue_frames = STREAM_QUEUE_FRAMES;
+            sctx->blob = sb;
+            sctx->blob_bytes = body;
+            sctx->lend_bytes = (size_t)(qu + qb - sb);
+            sctx->lent = false;
+            snprintf(sctx->blob_path, sizeof(sctx->blob_path), "%s", filepath);
+            if (real_engine_load(sctx, sb, body)) return true;
+            sctx->split = false;
+            return false;
+        }
+        if (fseek(f, 0, SEEK_SET) != 0) {
+            fclose(f);
+            OCR_ERR("unseekable %s", filepath);
+            return false;
+        }
+    }
+
     /* The network reads its weights in place, so the whole blob lives in
      * POOL_OCR_WEIGHTS (safir_alloc returns 16-byte aligned memory, as vocr_load needs). */
     size_t free_bytes = safir_pool_capacity(POOL_OCR_WEIGHTS) - safir_pool_used(POOL_OCR_WEIGHTS);
-    void *buf = safir_alloc(POOL_OCR_WEIGHTS, (size_t)fsize);
+    void *buf = model_alloc(sctx, (size_t)fsize);
     if (!buf) {
         fclose(f);
         OCR_ERR("POOL_OCR_WEIGHTS OOM: model %ld B, free %zu of %zu B", fsize, free_bytes,
@@ -460,6 +759,7 @@ bool safir_ocr_vocr_load_file(SafirOcrBackend *backend, const char *filepath) {
     if (rc == VOCR_OK) {
         ctx->blob = buf;
         ctx->blob_bytes = (size_t)fsize;
+        ctx->lend_bytes = (size_t)fsize;
         ctx->lent = false;
         snprintf(ctx->blob_path, sizeof(ctx->blob_path), "%s", filepath);
         return real_engine_load(ctx, buf, (size_t)fsize);
@@ -480,7 +780,11 @@ void *safir_ocr_vocr_lend_weights(SafirOcrBackend *backend, size_t *bytes) {
     SafirVocrContext *ctx = (SafirVocrContext *)backend->userdata;
     if (!ctx->real || !ctx->blob || !ctx->blob_path[0]) return NULL;
     ctx->lent = true;
-    if (bytes) *bytes = ctx->blob_bytes;
+    if (ctx->ext) { /* all of the caller's model memory */
+        if (bytes) *bytes = ctx->ext_cap;
+        return ctx->ext;
+    }
+    if (bytes) *bytes = ctx->lend_bytes;
     return ctx->blob;
 }
 
@@ -495,13 +799,19 @@ bool safir_ocr_vocr_restore_weights(SafirOcrBackend *backend) {
         OCR_ERR("re-reading model: fopen failed errno=%d (%s)", e, strerror(e));
         return false;
     }
-    size_t rd = fread(ctx->blob, 1, ctx->blob_bytes, f);
+    bool rd_ok;
+    if (ctx->split) {
+        rd_ok = read_split(f, (uint8_t *)ctx->blob, ctx->hole_off, ctx->hole_len, ctx->total);
+    } else {
+        rd_ok = fread(ctx->blob, 1, ctx->blob_bytes, f) == ctx->blob_bytes;
+    }
     fclose(f);
-    if (rd != ctx->blob_bytes) {
-        OCR_ERR("re-reading model: short read %zu of %zu B", rd, ctx->blob_bytes);
+    if (!rd_ok) {
+        OCR_ERR("re-reading model: short read of %zu B", ctx->blob_bytes);
         return false;
     }
-    int rc = vocr_load(&ctx->vm, ctx->blob, ctx->blob_bytes);
+    int rc = ctx->split ? vocr_load_split(&ctx->vm, ctx->blob, ctx->blob_bytes, ctx->hole_off, ctx->hole_len)
+                        : vocr_load(&ctx->vm, ctx->blob, ctx->blob_bytes);
     if (rc != VOCR_OK) {
         OCR_ERR("re-reading model: vocr_load: %s (%d)", vocr_strerror(rc), rc);
         return false;
@@ -820,7 +1130,24 @@ static bool real_recognize_line(SafirVocrContext *ctx, vocr_ctx *vc, const uint8
     im.stride = stride;
     im.format = VOCR_GREY8 | (dark ? VOCR_INVERT : 0);
 
-    (void)ctx;
+    if (ctx->split) { /* a batch of one line: body, then the streamed head */
+        QueueView v = queue_view(ctx);
+        memset(&ex, 0, sizeof(ex));
+        ex.cap_frames = ctx->queue_frames;
+        ex.no_head = 1;
+        ex.head_q16 = v.q16;
+        ex.head_s16 = v.s16;
+        if (vocr_run(vc, &im, text, text_cap, &ex) != VOCR_OK || !head_pass(ctx, ex.frames)) return false;
+        vocr_extra dx;
+        memset(&dx, 0, sizeof(dx));
+        int drc = vocr_head_decode(&ctx->vm, v.besti, ex.frames, v.tl, STREAM_TOPK, text, text_cap, &dx);
+        if (drc != VOCR_OK && drc != VOCR_E_TEXT) return false;
+        memcpy(best, v.besti, (ex.frames < REAL_MAX_FRAMES ? ex.frames : REAL_MAX_FRAMES) * sizeof(uint16_t));
+        *frames = ex.frames;
+        *resized_w = ex.width;
+        *conf = dx.conf_mean;
+        return true;
+    }
     int rc = vocr_run(vc, &im, text, text_cap, &ex);
     if (rc != VOCR_OK && rc != VOCR_E_TEXT) {
         return false;
@@ -1061,17 +1388,103 @@ static unsigned cjk_letter_count(const SafirTextLine *tl) {
     return letters;
 }
 
-static bool s_scan_debug = false; /* host diagnostics (safir_scan_set_debug) */
 static const float kMinLineConfidence = 0.6f;
 /* Extra lines in a two-pass band (not the band's main line) need clearer evidence: dialogue
  * reads at >= 0.96, while art specks that pass the Japanese test score up to ~0.8. */
 static const float kMinExtraLineConfidence = 0.9f;
 
 /* Recognizes line L of the crop and appends it to out (unless filtered). */
+static void finish_line(const SafirVocrContext *ctx, const uint8_t *gray_crop, uint16_t crop_w, uint16_t crop_h,
+                        const VocrLine *L, SafirRect screen_region, SafirOcrResult *out_result, bool text_filter,
+                        float min_conf, const uint16_t *best, unsigned frames, unsigned rw, float conf);
+
+/* Lines whose body has run, waiting for one streamed head pass over all of them. */
+typedef struct LineJob {
+    VocrLine L;
+    const uint8_t *px;
+    uint16_t w, h;
+    SafirRect screen;
+    float min_conf;
+    bool text_filter;
+    unsigned f0, frames, rw;
+} LineJob;
+typedef struct LineBatch {
+    SafirOcrResult *out;
+    LineJob job[SAFIR_MAX_LINES_PER_BOX];
+    unsigned n, used;
+} LineBatch;
+
+static void batch_flush(SafirVocrContext *ctx) {
+    LineBatch *b = ctx->batch;
+    if (!b || b->n == 0) return;
+    if (head_pass(ctx, b->used)) {
+        QueueView v = queue_view(ctx);
+        for (unsigned i = 0; i < b->n; ++i) {
+            const LineJob *j = &b->job[i];
+            char text[SAFIR_MAX_CHARS_PER_LINE * 4 + 8];
+            vocr_extra dx;
+            memset(&dx, 0, sizeof(dx));
+            int rc = vocr_head_decode(&ctx->vm, v.besti + j->f0, j->frames, v.tl + (size_t)j->f0 * STREAM_TOPK,
+                                      STREAM_TOPK, text, sizeof(text), &dx);
+            if (rc != VOCR_OK && rc != VOCR_E_TEXT) continue;
+            if (b->out->line_count >= SAFIR_MAX_LINES_PER_BOX) break;
+            finish_line(ctx, j->px, j->w, j->h, &j->L, j->screen, b->out, j->text_filter, j->min_conf,
+                        v.besti + j->f0, j->frames < REAL_MAX_FRAMES ? j->frames : REAL_MAX_FRAMES, j->rw,
+                        dx.conf_mean);
+        }
+    }
+    b->n = 0;
+    b->used = 0;
+}
+
+/* Runs the body of one line into the batch; the head and the rest wait for batch_flush. A line is read
+ * exactly when the sequential order would read it: when fewer than the maximum lines were kept before it. */
+static void batch_add(SafirVocrContext *ctx, vocr_ctx *vc, const uint8_t *gray_crop, uint16_t crop_w,
+                      uint16_t crop_h, const VocrLine *L, SafirRect screen_region, bool text_filter, float min_conf) {
+    LineBatch *b = ctx->batch;
+    if (b->out->line_count + b->n >= SAFIR_MAX_LINES_PER_BOX) batch_flush(ctx);
+    if (b->out->line_count >= SAFIR_MAX_LINES_PER_BOX) return;
+    const unsigned bound = vocr_resized_width(&ctx->vm, L->w, L->h) / ctx->vm.stride + 2u;
+    if (b->used + bound > ctx->queue_frames) batch_flush(ctx);
+    const unsigned K = ctx->vm.op[ctx->vm.n_ops - 1].k;
+    QueueView v = queue_view(ctx);
+    vocr_image im;
+    im.pixels = gray_crop + (size_t)L->y * crop_w + L->x;
+    im.width = L->w;
+    im.height = L->h;
+    im.stride = crop_w;
+    im.format = VOCR_GREY8 | (L->dark ? VOCR_INVERT : 0);
+    vocr_extra ex;
+    memset(&ex, 0, sizeof(ex));
+    ex.cap_frames = ctx->queue_frames - b->used;
+    ex.no_head = 1;
+    ex.head_q16 = v.q16 + (size_t)b->used * K;
+    ex.head_s16 = v.s16 + b->used;
+    char text[8];
+    if (vocr_run(vc, &im, text, sizeof(text), &ex) != VOCR_OK) return;
+    LineJob *j = &b->job[b->n++];
+    j->L = *L;
+    j->px = gray_crop;
+    j->w = crop_w;
+    j->h = crop_h;
+    j->screen = screen_region;
+    j->min_conf = min_conf;
+    j->text_filter = text_filter;
+    j->f0 = b->used;
+    j->frames = ex.frames;
+    j->rw = ex.width;
+    b->used += ex.frames;
+}
+
 static void recognize_one_line(SafirVocrContext *ctx, vocr_ctx *vc, const uint8_t *gray_crop, uint16_t crop_w,
                                uint16_t crop_h, const VocrLine *L, SafirRect screen_region, SafirOcrResult *out_result,
                                bool text_filter, float min_conf) {
-    if (L->w < 4 || L->h < 4 || out_result->line_count >= SAFIR_MAX_LINES_PER_BOX) return;
+    if (L->w < 4 || L->h < 4) return;
+    if (ctx->batch) {
+        batch_add(ctx, vc, gray_crop, crop_w, crop_h, L, screen_region, text_filter, min_conf);
+        return;
+    }
+    if (out_result->line_count >= SAFIR_MAX_LINES_PER_BOX) return;
     char text[SAFIR_MAX_CHARS_PER_LINE * 4 + 8];
     uint16_t best[REAL_MAX_FRAMES];
     unsigned frames = 0, rw = 0;
@@ -1081,6 +1494,13 @@ static void recognize_one_line(SafirVocrContext *ctx, vocr_ctx *vc, const uint8_
         return;
     }
     if (frames > REAL_MAX_FRAMES) frames = REAL_MAX_FRAMES;
+    finish_line(ctx, gray_crop, crop_w, crop_h, L, screen_region, out_result, text_filter, min_conf, best, frames,
+                rw, conf);
+}
+
+static void finish_line(const SafirVocrContext *ctx, const uint8_t *gray_crop, uint16_t crop_w, uint16_t crop_h,
+                        const VocrLine *L, SafirRect screen_region, SafirOcrResult *out_result, bool text_filter,
+                        float min_conf, const uint16_t *best, unsigned frames, unsigned rw, float conf) {
     SafirTextLine *tl = &out_result->lines[out_result->line_count];
     tl->char_count = 0;
     tl->dhash = out_result->dhash;
@@ -1113,16 +1533,8 @@ static bool real_recognize(SafirVocrContext *ctx, const uint8_t *gray_crop, uint
     li.height = crop_h;
     li.stride = crop_w;
     li.bpp = VOCR_LINES_GREY;
-    size_t lines_need = vocr_lines_arena_bytes(crop_w, crop_h);
-    void *lines_arena = safir_alloc(POOL_OCR_SCRATCH, lines_need);
-    if (!lines_arena) {
-        OCR_ERR("POOL_OCR_SCRATCH OOM: line finder needs %zu B", lines_need);
-        return false;
-    }
     VocrLineSet set;
-    memset(&set, 0, sizeof(set));
-    int rc = vocr_find_lines(&li, s_line_finder, lines_arena, lines_need, &set);
-    safir_pool_rewind(POOL_OCR_SCRATCH, mark); /* finder arena is scratch only */
+    int rc = find_lines(&li, VOCR_TEXTSPOT6_SCALE1, &set); /* the crop is at half resolution */
     if (rc != VOCR_LINES_OK) {
         OCR_ERR("vocr_find_lines failed (%d)", rc);
         return false;
@@ -1150,7 +1562,13 @@ static bool real_recognize(SafirVocrContext *ctx, const uint8_t *gray_crop, uint
         return false;
     }
 
-    /* 3. Recognize each line, top to bottom. */
+    /* 3. Recognize each line, top to bottom (with a streamed head: bodies first, one head pass). */
+    LineBatch batch;
+    if (ctx->split) {
+        memset(&batch, 0, sizeof(batch));
+        batch.out = out_result;
+        ctx->batch = &batch;
+    }
     char why[96];
     size_t why_len = 0;
     why[0] = '\0';
@@ -1163,6 +1581,10 @@ static bool real_recognize(SafirVocrContext *ctx, const uint8_t *gray_crop, uint
         }
         recognize_one_line(ctx, &vc, gray_crop, crop_w, crop_h, L, screen_region, out_result, text_filter,
                            kMinLineConfidence);
+    }
+    if (ctx->batch) {
+        batch_flush(ctx);
+        ctx->batch = NULL;
     }
 
     safir_pool_rewind(POOL_OCR_SCRATCH, mark);
@@ -1223,6 +1645,7 @@ SafirOcrBackend *safir_ocr_vocr_create(const SafirOcrConfig *config) {
     }
 
     memset(ctx, 0, sizeof(SafirVocrContext));
+    s_spot_ok = false; /* its blob was in POOL_OCR_WEIGHTS, which a new backend starts over */
     if (config) {
         ctx->config = *config;
     } else {
@@ -1277,14 +1700,8 @@ int safir_scan_prepare(const uint8_t *jpeg, size_t jpeg_size, SafirRect region, 
     }
     const bool inverted = safir_crop_auto_invert(buf, hw, hh);
     VocrLinesImage li = { buf, hw, hh, hw, VOCR_LINES_GREY };
-    size_t mark = safir_pool_used(POOL_OCR_SCRATCH);
-    size_t need = vocr_lines_arena_bytes(hw, hh);
-    void *arena = safir_alloc(POOL_OCR_SCRATCH, need);
-    if (!arena) return -3;
     VocrLineSet set;
-    memset(&set, 0, sizeof(set));
-    int rc = vocr_find_lines(&li, s_line_finder, arena, need, &set);
-    safir_pool_rewind(POOL_OCR_SCRATCH, mark);
+    int rc = find_lines(&li, VOCR_TEXTSPOT6_SCALE1, &set); /* half resolution */
     if (rc != VOCR_LINES_OK) return -4;
     plan->pass1_lines = (uint8_t)set.count;
     if (s_scan_debug) {
@@ -1351,14 +1768,9 @@ int safir_scan_prepare(const uint8_t *jpeg, size_t jpeg_size, SafirRect region, 
                 uint8_t *px = rt[a].out;
                 if (inverted) /* same polarity as the pass-1 frame */
                     for (size_t q = 0; q < (size_t)R.w * R.h; ++q) px[q] = (uint8_t)(255 - px[q]);
-                size_t m2 = safir_pool_used(POOL_OCR_SCRATCH);
-                size_t need2 = vocr_lines_arena_bytes(R.w, R.h);
-                void *ar2 = safir_alloc(POOL_OCR_SCRATCH, need2);
-                if (!ar2) continue;
                 VocrLinesImage li2 = { px, R.w, R.h, R.w, VOCR_LINES_GREY };
                 VocrLineSet s2;
-                memset(&s2, 0, sizeof(s2));
-                if (vocr_find_lines(&li2, s_line_finder, ar2, need2, &s2) == VOCR_LINES_OK && s2.count > 0) {
+                if (find_lines(&li2, VOCR_TEXTSPOT6_SCALE2, &s2) == VOCR_LINES_OK && s2.count > 0) {
                     replaced[rsrc[a]] = true;
                     for (unsigned k = 0; k < s2.count && nlines < ARRAY_LEN_C(lines); ++k) {
                         const VocrLine *F = &s2.lines[k];
@@ -1375,7 +1787,6 @@ int safir_scan_prepare(const uint8_t *jpeg, size_t jpeg_size, SafirRect region, 
                                     R.x + F->x, R.y + F->y, rsrc[a]);
                     }
                 }
-                safir_pool_rewind(POOL_OCR_SCRATCH, m2);
             }
         }
         for (unsigned i = 0; i < set.count && nlines < ARRAY_LEN_C(lines); ++i)
@@ -1631,25 +2042,29 @@ bool safir_ocr_vocr_recognize_plan(SafirOcrBackend *backend, const uint8_t *buf,
      * band's centre (fallback: the whole band). Other lines lying fully inside the band are
      * read too, with a stricter filter: pass 1 can glue a dialogue line to the portrait or
      * art beside it, and then the band's centre is the art (console 2026-11-05: line 2 of
-     * a speech box was lost this way). Lines clipped by the band edge belong to a neighbour. */
+     * a speech box was lost this way). Lines clipped by the band edge belong to a neighbour.
+     * With a streamed head, the bodies of the lines run first and one head pass reads them all. */
+    LineBatch batch;
+    if (ctx->split) {
+        memset(&batch, 0, sizeof(batch));
+        batch.out = out;
+        ctx->batch = &batch;
+    }
     for (unsigned j = 0; j < plan->count && out->line_count < SAFIR_MAX_LINES_PER_BOX; ++j) {
         const SafirScanBlock *b = &plan->blocks[j];
         const uint8_t *px = buf + b->offset;
         VocrLine cand[VOCR_LINES_MAX];
         unsigned ncand = 0;
-        size_t fmark = safir_pool_used(POOL_OCR_SCRATCH);
-        size_t fneed = vocr_lines_arena_bytes(b->w, b->h);
-        void *farena = safir_alloc(POOL_OCR_SCRATCH, fneed);
-        if (farena) {
+        {
+            /* a band decoded at full resolution is read halved by the spotter, one at half resolution as it is */
             VocrLinesImage li = { px, b->w, b->h, b->w, VOCR_LINES_GREY };
             VocrLineSet set;
-            memset(&set, 0, sizeof(set));
-            if (vocr_find_lines(&li, s_line_finder, farena, fneed, &set) == VOCR_LINES_OK) {
+            const unsigned sf = b->screen.w > b->w ? VOCR_TEXTSPOT6_SCALE1 : VOCR_TEXTSPOT6_SCALE2;
+            if (find_lines(&li, sf, &set) == VOCR_LINES_OK) {
                 for (unsigned k = 0; k < set.count; ++k)
                     if (set.lines[k].w >= 4 && set.lines[k].h >= 4) cand[ncand++] = set.lines[k];
             }
         }
-        safir_pool_rewind(POOL_OCR_SCRATCH, fmark);
 
         const int cy = (int)b->h / 2;
         int best = -1, best_d = 0;
@@ -1684,6 +2099,10 @@ bool safir_ocr_vocr_recognize_plan(SafirOcrBackend *backend, const uint8_t *buf,
             }
             recognize_split(ctx, &vc, px, b->w, b->h, c, b->screen, out, kMinExtraLineConfidence);
         }
+    }
+    if (ctx->batch) {
+        batch_flush(ctx);
+        ctx->batch = NULL;
     }
     safir_pool_rewind(POOL_OCR_SCRATCH, mark);
 

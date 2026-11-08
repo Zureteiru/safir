@@ -215,11 +215,24 @@ static int in_blob(uint32_t total, uint32_t off, uint32_t n)
     return off >= HEADER_BYTES && !(off & 15u) && off <= total && n <= total - off;
 }
 
+/* safir: split load (vocr_load_split). The buffer holds the blob without the head's arrays [hole_off,
+ * hole_off + hole_len): blob offsets past the hole sit hole_len lower. A range must lie wholly outside the hole,
+ * the head's own arrays wholly inside (inside = 1; then they stay in the file and the op's pointers are NULL). */
+static int hole_ok(const vocr_model *m, uint32_t off, uint32_t n, int inside)
+{
+    const uint32_t h0 = m->hole_off, h1 = m->hole_off + m->hole_len;
+    if (!m->hole_len) return !inside;
+    return inside ? off >= h0 && off <= h1 && n <= h1 - off : off + n <= h0 || off >= h1;
+}
+static const unsigned char *blob_at(const vocr_model *m, uint32_t off)
+{
+    return m->blob + (m->hole_len && off >= m->hole_off ? off - m->hole_len : off);
+}
+
 static int parse_op(vocr_model *m, unsigned i, const unsigned char *r, unsigned *rows,
                     unsigned *chans, uint32_t total)
 {
     vocr_op *op = &m->op[i];
-    const unsigned char *b = m->blob;
     uint32_t w_off = rd32(r + 16), w_bytes = rd32(r + 20), b_off = rd32(r + 24),
              s_off = rd32(r + 28);
     unsigned j, last = i + 1 == m->n_ops;
@@ -277,16 +290,18 @@ static int parse_op(vocr_model *m, unsigned i, const unsigned char *r, unsigned 
             op->k != op->cin || (op->flags & ~(unsigned)(F_BIAS | F_INT8)) || !(op->flags & F_BIAS) || !heads ||
             dim < 8u || dim > 1024u || dim % heads || ((dim / heads) & 7u) || op->cout_pad != 3u * dim ||
             w_bytes != wsz * op->cout_pad * op->k || owb != wsz * op->cout * dim || !in_blob(total, ow, owb) ||
-            !in_blob(total, ob, 4u * op->cout) || ((op->flags & F_INT8) ? !in_blob(total, os, 4u * op->cout) : os != 0))
+            !in_blob(total, ob, 4u * op->cout) || ((op->flags & F_INT8) ? !in_blob(total, os, 4u * op->cout) : os != 0) ||
+            !hole_ok(m, ow, owb, 0) || !hole_ok(m, ob, 4u * op->cout, 0) ||
+            ((op->flags & F_INT8) && !hole_ok(m, os, 4u * op->cout, 0)))
             return VOCR_E_FORMAT;
         m->attn.heads = heads;
         m->attn.dim = dim;
-        m->attn.o_bias = (const float *)(const void *)(b + ob);
+        m->attn.o_bias = (const float *)(const void *)blob_at(m, ob);
         if (op->flags & F_INT8) {
-            m->attn.o_q = (const int8_t *)(const void *)(b + ow);
-            m->attn.o_scale = (const float *)(const void *)(b + os);
+            m->attn.o_q = (const int8_t *)(const void *)blob_at(m, ow);
+            m->attn.o_scale = (const float *)(const void *)blob_at(m, os);
         } else {
-            m->attn.o_w = (const float *)(const void *)(b + ow);
+            m->attn.o_w = (const float *)(const void *)blob_at(m, ow);
         }
     } else {
         unsigned collapse = (op->flags & F_COLLAPSE) != 0;
@@ -301,20 +316,32 @@ static int parse_op(vocr_model *m, unsigned i, const unsigned char *r, unsigned 
         if (w_bytes != (op->flags & F_INT8 ? 1u : 4u) * op->cout_pad * op->k) return VOCR_E_FORMAT;
         if (i == 0) return VOCR_E_FORMAT;
     }
-    if (!in_blob(total, w_off, w_bytes)) return VOCR_E_FORMAT;
-    if (op->flags & F_INT8) {
-        if (!in_blob(total, s_off, 4u * op->cout_pad)) return VOCR_E_FORMAT;
-        op->q = (const int8_t *)(const void *)(b + w_off);
-        op->scale = (const float *)(const void *)(b + s_off);
-    } else {
-        if (s_off) return VOCR_E_FORMAT;
-        op->w = (const float *)(const void *)(b + w_off);
-    }
-    if (op->flags & F_BIAS) {
-        if (!in_blob(total, b_off, 4u * op->cout_pad)) return VOCR_E_FORMAT;
-        op->bias = (const float *)(const void *)(b + b_off);
-    } else if (b_off) {
-        return VOCR_E_FORMAT;
+    {
+        /* split load: the head's arrays stay in the file (an int8 head with a bias only) */
+        const int ext = last && m->hole_len != 0;
+        if (ext && (op->flags & (F_INT8 | F_BIAS)) != (F_INT8 | F_BIAS)) return VOCR_E_FORMAT;
+        if (!in_blob(total, w_off, w_bytes) || !hole_ok(m, w_off, w_bytes, ext)) return VOCR_E_FORMAT;
+        if (op->flags & F_INT8) {
+            if (!in_blob(total, s_off, 4u * op->cout_pad) || !hole_ok(m, s_off, 4u * op->cout_pad, ext))
+                return VOCR_E_FORMAT;
+            op->q = ext ? NULL : (const int8_t *)(const void *)blob_at(m, w_off);
+            op->scale = ext ? NULL : (const float *)(const void *)blob_at(m, s_off);
+        } else {
+            if (s_off) return VOCR_E_FORMAT;
+            op->w = (const float *)(const void *)blob_at(m, w_off);
+        }
+        if (op->flags & F_BIAS) {
+            if (!in_blob(total, b_off, 4u * op->cout_pad) || !hole_ok(m, b_off, 4u * op->cout_pad, ext))
+                return VOCR_E_FORMAT;
+            op->bias = ext ? NULL : (const float *)(const void *)blob_at(m, b_off);
+        } else if (b_off) {
+            return VOCR_E_FORMAT;
+        }
+        if (ext) {
+            m->head_w_off = w_off;
+            m->head_s_off = s_off;
+            m->head_b_off = b_off;
+        }
     }
     *rows = op->h_out;
     *chans = op->cout;
@@ -370,7 +397,7 @@ static int parse_gate(vocr_model *m, const unsigned char *g, size_t avail)
     return VOCR_OK;
 }
 
-int vocr_load(vocr_model *m, const void *blob, size_t bytes)
+static int load_impl(vocr_model *m, const void *blob, size_t bytes, uint32_t hole_off, uint32_t hole_len)
 {
     const unsigned char *b = (const unsigned char *)blob;
     const uint16_t one = 1;
@@ -385,9 +412,18 @@ int vocr_load(vocr_model *m, const void *blob, size_t bytes)
         rd16(b + 6) != HEADER_BYTES)
         return VOCR_E_FORMAT;
     total = rd32(b + 8);
-    if (total < HEADER_BYTES || total > bytes || (rd32(b + 12) & ~1u)) return VOCR_E_FORMAT;
+    if (total < HEADER_BYTES || (rd32(b + 12) & ~1u)) return VOCR_E_FORMAT;
+    if (hole_len) { /* split: the buffer is the blob minus the hole, no trailers */
+        if ((hole_off | hole_len) & 15u || hole_off < HEADER_BYTES || hole_off > total || hole_len > total - hole_off ||
+            bytes < (size_t)(total - hole_len))
+            return VOCR_E_FORMAT;
+    } else if (total > bytes) {
+        return VOCR_E_FORMAT;
+    }
     m->blob = b;
     m->bytes = total;
+    m->hole_off = hole_off;
+    m->hole_len = hole_len;
     m->height = rd16(b + 16);
     m->max_width = rd16(b + 18);
     m->stride = rd16(b + 20);
@@ -400,11 +436,11 @@ int vocr_load(vocr_model *m, const void *blob, size_t bytes)
     if (!m->height || m->height > VOCR_MAX_HEIGHT || m->n_ops < 2 || m->n_ops > VOCR_MAX_OPS ||
         m->n_classes < 2 || m->n_classes > 65535u || !m->stride || m->stride > 64 ||
         m->max_width < MIN_WIDTH || m->max_width > 8192 || m->max_width % m->stride ||
-        !in_blob(total, ops_off, OP_BYTES * m->n_ops))
+        !in_blob(total, ops_off, OP_BYTES * m->n_ops) || !hole_ok(m, ops_off, OP_BYTES * m->n_ops, 0))
         return VOCR_E_FORMAT;
     rows = m->height;
     for (i = 0; i < m->n_ops; i++) {
-        rc = parse_op(m, i, b + ops_off + OP_BYTES * i, &rows, &chans, total);
+        rc = parse_op(m, i, blob_at(m, ops_off) + OP_BYTES * i, &rows, &chans, total);
         if (rc) return rc;
         stride *= m->op[i].sw;
         if (m->op[i].type >= T_PW) {
@@ -417,14 +453,16 @@ int vocr_load(vocr_model *m, const void *blob, size_t bytes)
         return VOCR_E_FORMAT;
     m->int8 = n_int8 != 0;
     if (!in_blob(total, v_off, 2u * (m->n_classes + 1u)) ||
-        v_bytes > total - v_off - 2u * (m->n_classes + 1u))
+        v_bytes > total - v_off - 2u * (m->n_classes + 1u) ||
+        !hole_ok(m, v_off, 2u * (m->n_classes + 1u) + v_bytes, 0))
         return VOCR_E_FORMAT;
-    m->vocab_off = (const uint16_t *)(const void *)(b + v_off);
-    m->vocab = (const char *)(b + v_off + 2u * (m->n_classes + 1u));
+    m->vocab_off = (const uint16_t *)(const void *)blob_at(m, v_off);
+    m->vocab = (const char *)blob_at(m, v_off) + 2u * (m->n_classes + 1u);
     if (m->vocab_off[0] || m->vocab_off[1] || m->vocab_off[m->n_classes] != v_bytes)
         return VOCR_E_FORMAT;
     for (i = 0; i < m->n_classes; i++)
         if (m->vocab_off[i] > m->vocab_off[i + 1]) return VOCR_E_FORMAT;
+    if (hole_len) return VOCR_OK; /* split: no gate, no two-level head */
     {
         const size_t g_off = al16(total);
         if (g_off <= bytes && bytes - g_off >= 4 && is_gate_magic(b + g_off)) {
@@ -438,6 +476,50 @@ int vocr_load(vocr_model *m, const void *blob, size_t bytes)
     rc = parse_two(m, b, bytes, total);
     if (rc) memset(&m->two, 0, sizeof m->two);
     return rc;
+}
+
+int vocr_load(vocr_model *m, const void *blob, size_t bytes)
+{
+    return load_impl(m, blob, bytes, 0, 0);
+}
+
+int vocr_load_split(vocr_model *m, const void *blob, size_t bytes, uint32_t hole_off, uint32_t hole_len)
+{
+    if (!hole_len) return VOCR_E_ARG;
+    return load_impl(m, blob, bytes, hole_off, hole_len);
+}
+
+int vocr_head_span(const void *hdr, size_t n, uint32_t *off, uint32_t *len, uint32_t *total)
+{
+    const unsigned char *b = (const unsigned char *)hdr, *r;
+    uint32_t ops_off, w_off, w_bytes, b_off, s_off, lo, hi, e;
+    unsigned n_ops, cout_pad;
+    if (!b || !off || !len || !total || n < HEADER_BYTES || !is_magic(b) || rd16(b + 4) != VOCR_BLOB_VERSION ||
+        rd16(b + 6) != HEADER_BYTES)
+        return VOCR_E_FORMAT;
+    *total = rd32(b + 8);
+    n_ops = rd16(b + 22);
+    ops_off = rd32(b + 28);
+    if (n_ops < 2 || n_ops > VOCR_MAX_OPS || ops_off < HEADER_BYTES || ops_off > n ||
+        (size_t)OP_BYTES * n_ops > n - ops_off)
+        return VOCR_E_FORMAT;
+    r = b + ops_off + OP_BYTES * (n_ops - 1u);
+    if (r[0] != T_HEAD || (r[1] & (F_INT8 | F_BIAS)) != (F_INT8 | F_BIAS)) return VOCR_E_MODE;
+    w_off = rd32(r + 16);
+    w_bytes = rd32(r + 20);
+    b_off = rd32(r + 24);
+    s_off = rd32(r + 28);
+    cout_pad = rd16(r + 34);
+    lo = w_off < b_off ? w_off : b_off;
+    if (s_off < lo) lo = s_off;
+    hi = w_off + w_bytes;
+    if ((e = b_off + 4u * cout_pad) > hi) hi = e;
+    if ((e = s_off + 4u * cout_pad) > hi) hi = e;
+    hi = (uint32_t)al16(hi);
+    if (lo < HEADER_BYTES || (lo & 15u) || hi <= lo || hi > *total) return VOCR_E_FORMAT;
+    *off = lo;
+    *len = hi - lo;
+    return VOCR_OK;
 }
 
 int vocr_has_gate(const vocr_model *m)
@@ -2460,6 +2542,107 @@ static void run_head2(const vocr_ctx *c, unsigned nf, out_t *o)
  * for every tile and batch size; runtime/tests/vocr_ref.py attn_exact is the bit-exact twin. */
 
 #if VOCR_HAS_ATTN
+/* safir: the head over nf accumulated frames, or with ex->no_head only their int16 head input (quant16, exactly as
+ * run_head's W8I path quantises it) for vocr_head_block. */
+static void head_batch(const vocr_ctx *c, unsigned nf, out_t *o, int two)
+{
+    vocr_extra *ex = o->ex;
+    if (ex && ex->no_head) {
+        const unsigned K = c->model->op[c->model->n_ops - 1].k;
+        quant16(at(c, c->acc_off), K, K, nf, ex->head_q16 + (size_t)o->frame * K, ex->head_s16 + o->frame);
+        o->frame += nf;
+        o->headed += nf;
+        return;
+    }
+    if (two) run_head2(c, nf, o);
+    else run_head(c, nf, o);
+}
+
+int vocr_head_block(const vocr_model *m, const int16_t *qx, const float *sx, unsigned nf, const int8_t *q,
+                    const float *scale, const float *bias, unsigned nb0, unsigned nblk, float *bestv, uint16_t *besti,
+                    unsigned topk, float *topk_logit, uint16_t *topk_class)
+{
+    const vocr_op *op;
+    unsigned K, N, nb, f0, qn, j, step = 4;
+    if (!m || !m->n_ops || !qx || !sx || !q || !scale || !bias || !bestv || !besti) return VOCR_E_ARG;
+    op = &m->op[m->n_ops - 1];
+    K = op->k;
+    N = m->n_classes;
+    if (!m->int8 || nb0 + nblk > op->cout_pad / 8u || topk > VOCR_TOPK_MAX ||
+        (topk && (!topk_logit || !topk_class)))
+        return VOCR_E_ARG;
+#ifdef VOCR_NEON
+    if (K >= 16u) step = VOCR_HEAD_CHUNK; /* as run_head: the same mm_i16 bits per frame at any batch size */
+    {
+        float tmp[VOCR_HEAD_CHUNK * 8];
+#else
+    {
+        float tmp[4 * 8];
+#endif
+        for (nb = 0; nb < nblk; nb++) {
+            const unsigned cls0 = (nb0 + nb) * 8u;
+            for (f0 = 0; f0 < nf; f0 += step) {
+                const unsigned pn = umin(step, nf - f0);
+                mm_i16(q + (size_t)nb * K * 8u, scale + nb * 8u, bias + nb * 8u, qx + (size_t)f0 * K, sx + f0, K, pn,
+                       tmp, 8, NULL, 0, 0);
+                for (qn = 0; qn < pn; qn++) {
+                    const unsigned f = f0 + qn;
+                    float *tv = topk ? topk_logit + (size_t)f * topk : NULL;
+                    uint16_t *tc = topk ? topk_class + (size_t)f * topk : NULL;
+                    for (j = 0; j < 8 && cls0 + j < N; j++) {
+                        const float v = tmp[qn * 8 + j];
+                        if (v > bestv[f]) {
+                            bestv[f] = v;
+                            besti[f] = (uint16_t)(cls0 + j);
+                        }
+                        if (topk && v > tv[topk - 1]) {
+                            unsigned p = topk - 1;
+                            while (p && v > tv[p - 1]) {
+                                tv[p] = tv[p - 1];
+                                tc[p] = tc[p - 1];
+                                p--;
+                            }
+                            tv[p] = v;
+                            tc[p] = (uint16_t)(cls0 + j);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return VOCR_OK;
+}
+
+int vocr_head_decode(const vocr_model *m, const uint16_t *besti, unsigned nf, const float *topk_logit, unsigned topk,
+                     char *text, size_t text_cap, vocr_extra *ex)
+{
+    out_t o;
+    unsigned f;
+    if (!m || !besti || !text || !text_cap || (topk && !topk_logit)) return VOCR_E_ARG;
+    text[0] = 0;
+    memset(&o, 0, sizeof o);
+    o.text = text;
+    o.cap = text_cap;
+    for (f = 0; f < nf; f++) {
+        if (topk && besti[f] && besti[f] != o.last) {
+            const float p = topk_conf(topk_logit + (size_t)f * topk, topk);
+            if (!o.conf_n || p < o.conf_min) o.conf_min = p;
+            o.conf_sum += p;
+            o.conf_n++;
+        }
+        ctc_push(m, &o, besti[f]);
+    }
+    if (ex) {
+        ex->chars = o.chars;
+        ex->conf_min = ex->conf_mean = 1.0f;
+        if (o.conf_n) {
+            ex->conf_min = o.conf_min;
+            ex->conf_mean = o.conf_sum / (float)o.conf_n;
+        }
+    }
+    return o.overflow ? VOCR_E_TEXT : VOCR_OK;
+}
+
 static int cancelled(vocr_extra *ex) { return ex && ex->cancel && ex->cancel(ex->user); }
 
 /* softmax over a row's first T values, in place: the first maximum, e = exp_neg(s - max) (in [e^-30, 1]),
@@ -2665,6 +2848,14 @@ int vocr_run(vocr_ctx *c, const vocr_image *img, char *text, size_t text_cap, vo
      * tile when the gate is planned or the head's input is asked for */
     if (c->gate == VOCR_HEAD_GATE_ON && !(ex && (ex->logits || ex->ungated)))
         o.fidx = (const uint16_t *)(const void *)(c->arena + c->fidx_off);
+    if (ex && ex->no_head) { /* safir: the body only; vocr_head_block runs the head */
+        if (c->mode != VOCR_MODE_W8I || c->gate || !ex->head_q16 || !ex->head_s16 || ex->cap_frames < T ||
+            ex->topk || ex->logits)
+            return VOCR_E_ARG;
+        two = 0;
+    } else if (m->hole_len) {
+        return VOCR_E_MODE; /* split load: the head's weights are not in memory */
+    }
     hook = c->gate || (ex && ex->head_in);
     for (i = 0, u = ln.padded; i < L; i++) wout[i] = u /= m->op[i].sw;
     VOCR_MARK(VOCR_PROF_RUN);
@@ -2708,8 +2899,7 @@ int vocr_run(vocr_ctx *c, const vocr_image *img, char *text, size_t text_cap, vo
         }
         if (acc_fill >= c->head) {
             VOCR_MARK(L - 1);
-            if (two) run_head2(c, acc_fill, &o);
-            else run_head(c, acc_fill, &o);
+            head_batch(c, acc_fill, &o, two);
             acc_fill = 0;
         }
         VOCR_MARK(VOCR_PROF_RUN);
@@ -2747,8 +2937,7 @@ int vocr_run(vocr_ctx *c, const vocr_image *img, char *text, size_t text_cap, vo
             }
             if (acc_fill >= c->head) {
                 VOCR_MARK(L - 1);
-                if (two) run_head2(c, acc_fill, &o);
-                else run_head(c, acc_fill, &o);
+                head_batch(c, acc_fill, &o, two);
                 acc_fill = 0;
             }
         }
@@ -2757,8 +2946,7 @@ int vocr_run(vocr_ctx *c, const vocr_image *img, char *text, size_t text_cap, vo
 #endif
     if (acc_fill) {
         VOCR_MARK(L - 1);
-        if (two) run_head2(c, acc_fill, &o);
-        else run_head(c, acc_fill, &o);
+        head_batch(c, acc_fill, &o, two);
         VOCR_MARK(VOCR_PROF_RUN);
     }
     if (o.fidx && o.frame < produced) { /* the line ends in frames the gate skipped */
