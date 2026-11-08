@@ -105,7 +105,7 @@ typedef struct SafirLookupResult {
     char headword[64];            /* Headword / Kanji (null-terminated UTF-8) */
     char reading[64];             /* Kana reading (null-terminated UTF-8) */
     char glossary[512];           /* Definition text (null-terminated UTF-8) */
-    char deinflect_rule[48];      /* Deinflection chain, base first (e.g. "causative+passive+past") */
+    char deinflect_rule[128];     /* Yomitan group names, base first (e.g. "causative+potential or passive") */
     uint16_t matched_chars;       /* Number of characters matched from start_char_idx */
     uint16_t matched_bytes;       /* Length of surface substring in bytes */
     uint16_t pos_mask;            /* Matched POS */
@@ -126,7 +126,7 @@ typedef struct SafirDictMatch {
     uint16_t matched_chars;       /* characters of the line this entry covers */
     uint16_t matched_bytes;
     uint8_t steps;                /* deinflection rules applied (0 = exact) */
-    char rule[48];                /* e.g. "-te+-te iru+past", empty when exact */
+    char rule[128];               /* Yomitan group names, base first, e.g. "-て+-いる+-た"; empty when exact */
 } SafirDictMatch;
 
 /* Word Token Boundary for Sentence Navigation (D-Pad Left / Right) */
