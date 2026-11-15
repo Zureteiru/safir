@@ -118,6 +118,13 @@ if (SAFIR_TARGET STREQUAL "HOST")
 
     endif()
 
+    # OCR corpus scorer (local-only, like the tests): built only where it exists.
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/ocr_corpus/ocr_corpus.cpp)
+        add_executable(ocr_corpus tools/ocr_corpus/ocr_corpus.cpp)
+        target_compile_definitions(ocr_corpus PRIVATE SAFIR_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(ocr_corpus PRIVATE safir_core)
+    endif()
+
 elseif (SAFIR_TARGET STREQUAL "SWITCH")
     message(STATUS "Configuring safir SWITCH target (.ovl overlay)")
 
