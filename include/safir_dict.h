@@ -165,8 +165,8 @@ typedef struct SafirDict {
 #define SAFIR_DICT_MAX_CACHE_PAGES 8
     uint8_t* page_cache;
     uint8_t page_cache_slots;
-    int32_t page_cache_anchor[SAFIR_DICT_MAX_CACHE_PAGES];
-    uint32_t page_cache_age[SAFIR_DICT_MAX_CACHE_PAGES];
+    int32_t page_cache_anchor[SAFIR_DICT_MAX_CACHE_PAGES + 1]; /* +1: cached_l2_buffer is the last LRU slot */
+    uint32_t page_cache_age[SAFIR_DICT_MAX_CACHE_PAGES + 1];
     uint32_t page_cache_clock;
     uint32_t page_reads;
     const uint8_t* cur_page;               /* page the last ensure_l2_page_cached() returned */
@@ -186,6 +186,9 @@ bool safir_dict_lookup_exact(SafirDict* dict, const char* term, uint16_t pos_fil
 
 /* Longest-match scanner at start_char_idx in text line with deinflection */
 bool safir_dict_scan_longest(SafirDict* dict, const SafirTextLine* line, uint16_t start_char_idx, SafirLookupResult* out);
+
+/* Same match as safir_dict_scan_longest, index only: no glossary block is read. */
+bool safir_dict_scan_longest_len(SafirDict* dict, const SafirTextLine* line, uint16_t start_char_idx, uint16_t* matched_chars);
 
 /* Every entry matching text at start_char_idx, Yomitan order: longer source text first,
  * then fewer deinflection steps, then more common. Returns how many were written. */

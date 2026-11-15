@@ -120,17 +120,19 @@ static const uint8_t *load_l2_page(SafirDict *dict, uint32_t anchor_idx) {
     int slot = -1;
     if (dict->page_cache && dict->page_cache_slots > 0) {
         uint32_t oldest = UINT32_MAX;
-        for (int i = 0; i < dict->page_cache_slots; ++i) {
+        /* Slot page_cache_slots is cached_l2_buffer. */
+        for (int i = 0; i <= dict->page_cache_slots; ++i) {
             if (dict->page_cache_anchor[i] == (int32_t)anchor_idx) {
                 dict->page_cache_age[i] = ++dict->page_cache_clock;
-                return dict->page_cache + (size_t)i * SAFIR_L2_PAGE_SIZE;
+                return i < dict->page_cache_slots ? dict->page_cache + (size_t)i * SAFIR_L2_PAGE_SIZE
+                                                  : dict->cached_l2_buffer;
             }
             if (dict->page_cache_age[i] < oldest) {
                 oldest = dict->page_cache_age[i];
                 slot = i;
             }
         }
-        dst = dict->page_cache + (size_t)slot * SAFIR_L2_PAGE_SIZE;
+        if (slot < dict->page_cache_slots) dst = dict->page_cache + (size_t)slot * SAFIR_L2_PAGE_SIZE;
         dict->page_cache_anchor[slot] = -1; /* invalid until the read succeeds */
     }
 
@@ -180,12 +182,16 @@ static void visit_key(SafirDict *dict, const char *term, uint16_t pos_filter, En
     if (target < 0) return;
 
     int first = target;
-    while (first > 0 && strcmp(dict->l1_anchors[first].headword, term) == 0) first--;
-    /* The next page too: anchors store at most 43 bytes of a headword, so a long key can
-     * sort past a truncated anchor. */
-    int last = target + 1 < (int)dict->l1_anchor_count ? target + 1 : target;
+    /* Anchors store at most 43 bytes of a headword: a page whose truncated anchor is a
+     * prefix of term may really start after term, so term can be in an earlier page. */
+    while (first > 0) {
+        const char *hw = dict->l1_anchors[first].headword;
+        size_t hw_len = strlen(hw);
+        if (strcmp(hw, term) != 0 && !(hw_len == 43 && strncmp(hw, term, 43) == 0)) break;
+        first--;
+    }
 
-    for (int a = first; a <= last; ++a) {
+    for (int a = first; a <= target; ++a) {
         const uint8_t *page = load_l2_page(dict, (uint32_t)a);
         if (!page) continue;
         const SafirL2PageHeader *hdr = (const SafirL2PageHeader *)page;
@@ -609,11 +615,12 @@ void safir_dict_set_page_cache(SafirDict *dict, void *buf, size_t bytes) {
     if (slots > SAFIR_DICT_MAX_CACHE_PAGES) slots = SAFIR_DICT_MAX_CACHE_PAGES;
     dict->page_cache = slots ? (uint8_t *)buf : NULL;
     dict->page_cache_slots = (uint8_t)slots;
-    for (int i = 0; i < SAFIR_DICT_MAX_CACHE_PAGES; ++i) {
+    for (int i = 0; i <= SAFIR_DICT_MAX_CACHE_PAGES; ++i) {
         dict->page_cache_anchor[i] = -1;
         dict->page_cache_age[i] = 0;
     }
     dict->page_cache_clock = 0;
+    dict->cached_l2_anchor_id = -1; /* cached_l2_buffer changes role with the cache */
 }
 
 uint32_t safir_dict_page_reads(const SafirDict *dict) {
@@ -622,10 +629,7 @@ uint32_t safir_dict_page_reads(const SafirDict *dict) {
 
 /* Longest match at start_char_idx; among entries of that length the one with the fewest
  * deinflection steps, then the most common (とした: とする "to try to" before 賭する). */
-bool safir_dict_scan_longest(SafirDict *dict, const SafirTextLine *line, uint16_t start_char_idx, SafirLookupResult *out) {
-    if (out) memset(out, 0, sizeof(*out));
-    if (!dict || !line || start_char_idx >= line->char_count || !out) return false;
-
+static size_t collect_longest(SafirDict *dict, const SafirTextLine *line, uint16_t start_char_idx) {
     CollectCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.buf = s_matches;
@@ -633,19 +637,34 @@ bool safir_dict_scan_longest(SafirDict *dict, const SafirTextLine *line, uint16_
     for (uint16_t len = scan_window(line, start_char_idx); len >= 1; --len) {
         ctx.count = 0;
         collect_len(dict, line, start_char_idx, len, &ctx);
-        if (ctx.count == 0) continue;
-        sort_matches(s_matches, ctx.count);
-        const SafirDictMatch *m = &s_matches[0];
-        SafirDiskIndexEntry e;
-        memset(&e, 0, sizeof(e));
-        e.block_id = m->block_id;
-        e.offset_in_block = m->offset_in_block;
-        e.gloss_len = m->gloss_len;
-        e.pos_mask = m->pos_mask;
-        e.freq_rank = m->freq_rank;
-        return fill_lookup_result(dict, &e, m->rule, m->matched_chars, m->matched_bytes, out);
+        if (ctx.count > 0) return ctx.count;
     }
-    return false;
+    return 0;
+}
+
+bool safir_dict_scan_longest(SafirDict *dict, const SafirTextLine *line, uint16_t start_char_idx, SafirLookupResult *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!dict || !line || start_char_idx >= line->char_count || !out) return false;
+
+    size_t count = collect_longest(dict, line, start_char_idx);
+    if (count == 0) return false;
+    sort_matches(s_matches, count);
+    const SafirDictMatch *m = &s_matches[0];
+    SafirDiskIndexEntry e;
+    memset(&e, 0, sizeof(e));
+    e.block_id = m->block_id;
+    e.offset_in_block = m->offset_in_block;
+    e.gloss_len = m->gloss_len;
+    e.pos_mask = m->pos_mask;
+    e.freq_rank = m->freq_rank;
+    return fill_lookup_result(dict, &e, m->rule, m->matched_chars, m->matched_bytes, out);
+}
+
+bool safir_dict_scan_longest_len(SafirDict *dict, const SafirTextLine *line, uint16_t start_char_idx, uint16_t *matched_chars) {
+    if (!dict || !line || start_char_idx >= line->char_count || !matched_chars) return false;
+    if (collect_longest(dict, line, start_char_idx) == 0) return false;
+    *matched_chars = s_matches[0].matched_chars;
+    return true;
 }
 
 void safir_dict_tokenize_line(SafirDict *dict, const SafirTextLine *line, SafirLineTokens *out_tokens) {
