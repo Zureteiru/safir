@@ -191,7 +191,7 @@ typedef struct SafirDhashCache {
 typedef struct SafirVocrContext {
     SafirOcrConfig config;
     SafirVocrModel model;   /* placeholder engine state */
-    SafirDhashCache cache;
+    SafirDhashCache *cache; /* only with config.use_dhash_cache (the Switch overlay scans without it) */
     bool real;              /* true: run the VOCR6.2 network from libs/vocr */
     int selftest;           /* -1 not run, 0 failed, 1 passed */
     vocr_model vm;          /* parsed blob; points into POOL_OCR_WEIGHTS */
@@ -553,7 +553,7 @@ static bool real_engine_load(SafirVocrContext *ctx, const void *blob, size_t byt
     }
     ctx->real = true;
     ctx->model.initialized = true;
-    ctx->cache.valid = false;
+    if (ctx->cache) ctx->cache->valid = false;
     ctx->selftest = run_selftest(ctx);
     s_last_load_real = true;
     s_last_selftest = ctx->selftest;
@@ -916,9 +916,7 @@ static void vocr_reset(SafirOcrBackend *self) {
         return;
     }
     SafirVocrContext *ctx = (SafirVocrContext *)self->userdata;
-    ctx->cache.valid = false;
-    ctx->cache.last_dhash = 0;
-    memset(&ctx->cache.cached_result, 0, sizeof(SafirOcrResult));
+    if (ctx->cache) memset(ctx->cache, 0, sizeof(*ctx->cache));
 }
 
 static bool placeholder_recognize(SafirOcrBackend *self,
@@ -938,11 +936,11 @@ static bool placeholder_recognize(SafirOcrBackend *self,
 
     /* Step 1: Perceptual Hash (dHash) & 0ms Cache Check */
     uint64_t current_dhash = safir_compute_dhash(gray_crop, crop_w, crop_h);
-    if (ctx->config.use_dhash_cache && ctx->cache.valid) {
-        uint32_t dist = safir_dhash_distance(current_dhash, ctx->cache.last_dhash);
+    if (ctx->cache && ctx->cache->valid) {
+        uint32_t dist = safir_dhash_distance(current_dhash, ctx->cache->last_dhash);
         if (dist <= SAFIR_DHASH_SIMILAR_THRESHOLD) {
             /* 0ms fast-path: reuse cached tokens */
-            memcpy(out_result, &ctx->cache.cached_result, sizeof(SafirOcrResult));
+            memcpy(out_result, &ctx->cache->cached_result, sizeof(SafirOcrResult));
             out_result->dhash = current_dhash;
             out_result->cached = true;
             return true;
@@ -1095,10 +1093,10 @@ static bool placeholder_recognize(SafirOcrBackend *self,
     }
 
     /* Save into dHash cache */
-    if (out_result->line_count > 0) {
-        memcpy(&ctx->cache.cached_result, out_result, sizeof(SafirOcrResult));
-        ctx->cache.last_dhash = current_dhash;
-        ctx->cache.valid = true;
+    if (ctx->cache && out_result->line_count > 0) {
+        memcpy(&ctx->cache->cached_result, out_result, sizeof(SafirOcrResult));
+        ctx->cache->last_dhash = current_dhash;
+        ctx->cache->valid = true;
     }
 
     return (out_result->line_count > 0);
@@ -1614,9 +1612,9 @@ static bool vocr_recognize(SafirOcrBackend *self,
     }
 
     uint64_t current_dhash = safir_compute_dhash(gray_crop, crop_w, crop_h);
-    if (ctx->config.use_dhash_cache && ctx->cache.valid &&
-        safir_dhash_distance(current_dhash, ctx->cache.last_dhash) <= SAFIR_DHASH_SIMILAR_THRESHOLD) {
-        memcpy(out_result, &ctx->cache.cached_result, sizeof(SafirOcrResult));
+    if (ctx->cache && ctx->cache->valid &&
+        safir_dhash_distance(current_dhash, ctx->cache->last_dhash) <= SAFIR_DHASH_SIMILAR_THRESHOLD) {
+        memcpy(out_result, &ctx->cache->cached_result, sizeof(SafirOcrResult));
         out_result->dhash = current_dhash;
         out_result->cached = true;
         return true;
@@ -1625,10 +1623,10 @@ static bool vocr_recognize(SafirOcrBackend *self,
     memset(out_result, 0, sizeof(SafirOcrResult));
     out_result->dhash = current_dhash;
     bool ok = real_recognize(ctx, gray_crop, crop_w, crop_h, screen_region, out_result, false);
-    if (ok) {
-        memcpy(&ctx->cache.cached_result, out_result, sizeof(SafirOcrResult));
-        ctx->cache.last_dhash = current_dhash;
-        ctx->cache.valid = true;
+    if (ok && ctx->cache) {
+        memcpy(&ctx->cache->cached_result, out_result, sizeof(SafirOcrResult));
+        ctx->cache->last_dhash = current_dhash;
+        ctx->cache->valid = true;
     }
     return ok;
 }
@@ -1653,6 +1651,14 @@ SafirOcrBackend *safir_ocr_vocr_create(const SafirOcrConfig *config) {
         ctx->config.beam_width = 4;
         ctx->config.min_confidence = 0.5f;
         ctx->config.use_dhash_cache = true;
+    }
+
+    if (ctx->config.use_dhash_cache) {
+        ctx->cache = (SafirDhashCache *)safir_alloc(POOL_OCR_WEIGHTS, sizeof(SafirDhashCache));
+        if (!ctx->cache) {
+            return NULL;
+        }
+        memset(ctx->cache, 0, sizeof(*ctx->cache));
     }
 
     backend->name = "vocr_local";

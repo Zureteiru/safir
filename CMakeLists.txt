@@ -161,11 +161,10 @@ elseif (SAFIR_TARGET STREQUAL "SWITCH")
     # (safir_pool_attach), so .bss holds no model memory.
     target_compile_definitions(safir_core PRIVATE SAFIR_OCR_WEIGHTS_EXTERNAL)
 
+    # bg_worker.c and overlay_ui.cpp are host-test only: the console never ran them.
     add_library(safir_switch STATIC
         switch/games_ini.c
-        switch/bg_worker.c
         switch/mock_libnx.c
-        switch/overlay_ui.cpp
     )
     target_include_directories(safir_switch PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include

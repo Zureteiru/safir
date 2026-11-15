@@ -14,8 +14,8 @@ extern "C" {
 }
 
 #include "mock_libnx.h"
-#include "overlay_ui.h"
-#include "bg_worker.h"
+#include "safir_dict.h"
+#include "safir_ocr.h"
 #include "safir_ledger.h"
 #include "safir_crop.h"
 #include "games_ini.h"
@@ -37,7 +37,9 @@ extern "C" {
 /* ------------------------------------------------------------------------- */
 
 static SafirDict s_switch_dict;
-static SafirOverlayConfig s_switch_cfg;
+static const char *kGamesIniPath = "sdmc:/config/safir/games.ini";
+static u64 s_title_id = 0;      /* the running game, read again every time the overlay opens */
+static bool s_region_known = false;
 static SafirOcrBackend *s_switch_ocr = nullptr;
 static bool s_dict_loaded = false;
 static bool s_ocr_loaded = false;
@@ -45,8 +47,7 @@ static bool s_assets_probed = false;
 
 static Result s_rc_capssc = 0;
 /* What a scan captures: the full screen, or the games.ini region for this title. Owned
- * here (set at the END of initServices) because safir_bg_worker_init() and safir_ui_init()
- * both reset their own copy to the old 90,480 1100x210 default. */
+ * here (refresh_game_region). */
 static SafirRect s_scan_rect = { 0, 0, 1280, 720 };
 static Result s_rc_pminfo = 0;
 /* Heap a scan needs: only the 640x360 grey crop (225 KB), allocated while the scan runs.
@@ -73,7 +74,6 @@ static char s_detail[768] = "";    /* explanation box shown when a scan finds no
  * only when it is selected (load_entries). */
 struct ScanWord {
     std::string surface;   /* as it appears on screen, e.g. 食べさせられなかった */
-    std::string headword;  /* best entry's dictionary form, e.g. 食べる */
     unsigned line;
     uint16_t char_start, char_count;
     s32 x0, y0, x1, y1;    /* union of the word's character boxes, screen pixels (1280x720) */
@@ -94,7 +94,7 @@ static const int kBlankFramesBeforeCapture = 4;
 /* First scan after the overlay opens waits longer: the game is still being moved out of
  * focus, and capturing during that transition is suspect for the failures seen right after
  * opening. Failed captures are retried automatically, with a growing delay. */
-static const int kFramesBeforeFirstCapture = 20;
+static const int kFramesBeforeFirstCapture = 8;
 static int s_capture_failures = 0;
 static const int kMaxAutoRetries = 2;
 
@@ -117,8 +117,8 @@ static bool s_save_scans = false;
 static char s_ocr_model_path[96] = "";
 static const char *s_ocr_model_label = "none";
 static char s_ocr_model_note[192] = "";
-/* Backend and context next to the blob in the pool: 20.6 KB measured on the host. */
-static const size_t kOcrContextBytes = (32 + 56) * 1024; /* backend + context + the 52 KB textspot8 blob */
+/* Backend and context next to the blob in the pool: about 4 KB (no dHash cache on the Switch). */
+static const size_t kOcrContextBytes = (16 + 56) * 1024; /* backend + context + the 52 KB textspot8 blob */
 static const char *s_spotter_name = "textspot8_t64n8c16_w8.vtsp";
 static bool s_use_spotter = true; /* config.ini line_finder=textspot8 (default) | classic */
 /* config.ini share_popup_memory=1: no heap block for the model. During a scan the popup is hidden
@@ -176,27 +176,51 @@ static void write_scan_log(const SafirScanPlan *plan, unsigned lines_read) {
 }
 
 /* Event log for bug reports: sdmc:/switch/safir/events.log, rewritten each time the overlay
- * loads (at most kMaxEvents lines). Records opens, closes, scan requests and what each scan
- * read, to find why reopening with the scan combo could show the previous scan (2026-11-05).
+ * loads. Records opens, closes, scan requests and what each scan read, to find why reopening
+ * with the scan combo could show the previous scan (2026-11-05). At kMaxEvents lines the file
+ * becomes events.prev.log and a new one starts, so a long session keeps its latest scans.
  * Main thread only; onHide() (which libtesla may call from its input thread) just counts. */
 static unsigned s_event_lines = 0;
 static const unsigned kMaxEvents = 400;
+static bool s_event_started = false;
 static u64 s_event_t0 = 0;
 static u32 s_scan_no = 0;
 static volatile u32 s_hide_count = 0;
 static u32 s_hide_logged = 0;
+static const char *kEventsPath = "sdmc:/switch/safir/events.log";
+static const char *kEventsPrevPath = "sdmc:/switch/safir/events.prev.log";
+/* Held open for the length of a scan (evlog_hold), so a scan's 10-20 lines cost one open.
+ * Never left open between scans: a FILE still open when sdmc is unmounted crashes exit(). */
+static FILE *s_event_file = nullptr;
+static bool s_event_hold = false;
+static void evlog_hold(bool hold) {
+    s_event_hold = hold;
+    if (!hold && s_event_file) {
+        fclose(s_event_file);
+        s_event_file = nullptr;
+    }
+}
 static void evlog(const char *fmt, ...) {
-    if (s_event_lines >= kMaxEvents) return;
     if (s_event_t0 == 0) s_event_t0 = armGetSystemTick();
-    FILE *f = fopen("sdmc:/switch/safir/events.log", s_event_lines == 0 ? "w" : "a");
+    if (s_event_lines >= kMaxEvents) {
+        if (s_event_file) { fclose(s_event_file); s_event_file = nullptr; }
+        remove(kEventsPrevPath);
+        rename(kEventsPath, kEventsPrevPath);
+        s_event_lines = 0;
+        s_event_started = false;
+    }
+    FILE *f = s_event_file;
+    if (!f) f = fopen(kEventsPath, s_event_started ? "a" : "w");
     if (!f) return;
+    s_event_started = true;
     fprintf(f, "%8llu ms  ", (unsigned long long)(armTicksToNs(armGetSystemTick() - s_event_t0) / 1000000ULL));
     va_list ap;
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);
     va_end(ap);
     fputc('\n', f);
-    fclose(f);
+    if (s_event_hold) s_event_file = f;
+    else fclose(f);
     s_event_lines++;
 }
 
@@ -333,7 +357,6 @@ static void load_ocr_model(void) {
         return;
     }
     s_ocr_loaded = true;
-    safir_bg_worker_set_backend(s_switch_ocr);
     if (safir_ocr_vocr_is_placeholder()) {
         snprintf(s_ocr_status, sizeof(s_ocr_status), "OCR WARN: %s is a synthetic test model (PLACEHOLDER)", path);
     } else if (safir_ocr_vocr_selftest_result() != 1) {
@@ -565,24 +588,20 @@ static bool acquire_capture_buffers(void) {
                  kCaptureBlockBytes / 1024, largest_free_block() / 1024, s_res_note);
         return false;
     }
-    safir_set_frame_crop_buffer(s_capture_block, kFrameCropBytes);
     s_heap_note[0] = '\0';
     return true;
 }
 
 static void release_capture_buffers(void) {
     safir_capture_set_jpeg_buffer(nullptr, 0);
-    safir_set_frame_crop_buffer(nullptr, 0);
     free(s_capture_block);
     s_capture_block = nullptr;
 }
 
 static void load_assets_if_needed(void) {
-    safir_engine_lock();
     if (!s_dict_loaded) load_dictionary();
     if (!s_ocr_loaded && !s_share_fb) load_ocr_model(); /* shared: only inside a scan */
     s_assets_probed = true;
-    safir_engine_unlock();
 }
 
 static void set_pill(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -597,8 +616,8 @@ static void set_pill(const char *fmt, ...) {
  * one contiguous free region: glyph bitmaps, word list, lines. */
 static void release_scan_state(void);
 
-/* Recognized lines -> s_scan_lines, line boxes and dictionary words (both engines).
- * Called with the engine lock held. Returns the number of characters. */
+/* Recognized lines -> s_scan_lines, line boxes and dictionary words.
+ * Returns the number of characters. */
 static unsigned collect_scan_words(const SafirOcrResult &ocr_res, unsigned nlines) {
     unsigned total_chars = 0;
     s_scan_lines.clear();
@@ -628,11 +647,11 @@ static unsigned collect_scan_words(const SafirOcrResult &ocr_res, unsigned nline
         /* Yomitan-style scan: longest match (with deinflection) at each position; a
          * position without a match (punctuation, names, OCR noise) is skipped. */
         for (uint16_t i = 0; i < tl->char_count && s_scan_words.size() < kMaxScanWords;) {
-            SafirLookupResult lres;
-            memset(&lres, 0, sizeof(lres));
-            bool hit = safir_dict_scan_longest(&s_switch_dict, tl, i, &lres) && lres.found && lres.matched_chars > 0;
+            /* Index only: the entry itself (a 16 KB block read and inflate) is fetched when a
+             * word is selected (load_entries), not for every word of the scan. */
+            uint16_t m = 0;
+            bool hit = safir_dict_scan_longest_len(&s_switch_dict, tl, i, &m) && m > 0;
             if (!hit) { ++i; continue; }
-            uint16_t m = lres.matched_chars;
             if (m > tl->char_count - i) m = (uint16_t)(tl->char_count - i);
             SafirTextLine piece;
             memset(&piece, 0, sizeof(piece));
@@ -640,7 +659,7 @@ static unsigned collect_scan_words(const SafirOcrResult &ocr_res, unsigned nline
             piece.char_count = m;
             char surface[SAFIR_MAX_CHARS_PER_LINE * 4 + 1];
             safir_text_line_to_utf8(&piece, surface, sizeof(surface));
-            ScanWord w{ surface, lres.headword, l, i, m, INT32_MAX, INT32_MAX, 0, 0 };
+            ScanWord w{ surface, l, i, m, INT32_MAX, INT32_MAX, 0, 0 };
             for (uint16_t k = 0; k < m; ++k) {
                 const SafirRect &b = tl->chars[i + k].screen_box;
                 w.x0 = std::min<s32>(w.x0, b.x);
@@ -705,22 +724,28 @@ static void run_scan_now_body(void) {
     release_scan_state();
     s_detail[0] = '\0';
     ++s_scan_no;
+    evlog_hold(true);
     evlog("scan #%u: capture starts (local)", (unsigned)s_scan_no);
     if (!s_ocr_loaded) { /* a failed earlier load is retried */
-        safir_engine_lock();
         load_ocr_model();
-        safir_engine_unlock();
     }
     if (!acquire_capture_buffers()) {
         set_pill("Not enough memory to scan");
         snprintf(s_detail, sizeof(s_detail), "%s\nIn Ultrahand, raise the overlay memory (nx-ovlloader heap) to 6 or 8 MB, "
                  "or set popup_width=576 in sdmc:/config/safir/config.ini.", s_heap_note);
+        evlog("scan #%u: no memory for the capture block", (unsigned)s_scan_no);
+        evlog_hold(false);
         return;
     }
     note_heap_low("local OCR, capture buffers held");
     run_scan_now_inner();
     release_capture_buffers();
     evlog("scan #%u: done, %zu words, pill \"%s\"", (unsigned)s_scan_no, s_scan_words.size(), s_pill);
+    evlog_hold(false);
+}
+
+static u32 ms_since(u64 t0) {
+    return (u32)(armTicksToNs(armGetSystemTick() - t0) / 1000000ULL);
 }
 
 static void run_scan_now_inner(void) {
@@ -741,11 +766,9 @@ static void run_scan_now_inner(void) {
     size_t num_pixels = (size_t)crop_w * crop_h;
 
     u64 scan_t0 = armGetSystemTick();
-    safir_engine_lock();
 
-    uint8_t *crop_gray = safir_acquire_crop(num_pixels);
+    uint8_t *crop_gray = num_pixels <= kFrameCropBytes ? s_capture_block : nullptr;
     if (!crop_gray) {
-        safir_engine_unlock();
         set_pill("No memory for the screen crop");
         snprintf(s_detail, sizeof(s_detail),
                  "A %ux%u crop needs %zu B: heap buffer %s, scratch cap %zu B. "
@@ -760,6 +783,8 @@ static void run_scan_now_inner(void) {
     void *jpeg_buf = safir_ocr_vocr_lend_weights(s_switch_ocr, &lent_bytes);
     safir_capture_set_jpeg_buffer(jpeg_buf, lent_bytes);
     Result rc = safir_capture_crop_grayscale(crop_gray, rect, 100000000ULL);
+    const u32 capture_ms = ms_since(scan_t0); /* screenshot + half-resolution decode (+ stale retake) */
+    u32 plan_ms = 0;
 
     /* Two-pass scan while the JPEG still sits in the model's memory: lines are found on the
      * half-resolution frame just decoded, then each line is decoded again from the JPEG at
@@ -791,7 +816,9 @@ static void run_scan_now_inner(void) {
         }
         if (safir_capture_stale_note()[0]) evlog("scan #%u: screenshot %s", (unsigned)s_scan_no, safir_capture_stale_note());
         size_t cap = (crop_gray == s_capture_block) ? kFrameCropBytes : num_pixels;
+        const u64 plan_t0 = armGetSystemTick();
         plan_rc = safir_scan_prepare(jpeg, jpeg_size, rect, crop_gray, cap, true, &plan);
+        plan_ms = ms_since(plan_t0); /* line finding + full-resolution decodes */
         /* A plan that failed part-way may have overwritten the half-resolution frame:
          * decode it again now, while the JPEG still exists, for the single-pass fallback. */
         if (plan_rc != 0) (void)safir_jpeg_crop_gray(jpeg, jpeg_size, rect, crop_gray, nullptr, nullptr);
@@ -799,14 +826,12 @@ static void run_scan_now_inner(void) {
     safir_capture_set_jpeg_buffer(nullptr, 0);
     u64 reload_t0 = armGetSystemTick();
     if (jpeg_buf && !safir_ocr_vocr_restore_weights(s_switch_ocr)) {
-        safir_engine_unlock();
         set_pill("OCR model could not be re-read");
         snprintf(s_detail, sizeof(s_detail), "%s", safir_ocr_vocr_last_error());
         return;
     }
     s_reload_ms = (u32)(armTicksToNs(armGetSystemTick() - reload_t0) / 1000000ULL);
     if (R_FAILED(rc)) {
-        safir_engine_unlock();
         s_capture_failures++;
         /* Every attempt's code (JPEG on two layer stacks, then raw), not just the last. */
         set_pill("Capture failed: %s", safir_capture_last_diag());
@@ -816,9 +841,10 @@ static void run_scan_now_inner(void) {
     }
     s_capture_failures = 0;
 
-    SafirOcrResult &ocr_res = s_ocr_res; /* shared by both engines: one 16 KB buffer in .bss */
+    SafirOcrResult &ocr_res = s_ocr_res; /* one 16 KB buffer in .bss */
     memset(&ocr_res, 0, sizeof(ocr_res));
     bool recognized = false;
+    const u64 ocr_t0 = armGetSystemTick();
     if (plan_rc == 0) {
         recognized = safir_ocr_vocr_recognize_plan(s_switch_ocr, crop_gray, &plan, &ocr_res);
         write_scan_log(&plan, recognized ? ocr_res.line_count : 0u);
@@ -829,16 +855,23 @@ static void run_scan_now_inner(void) {
                      s_switch_ocr->recognize(s_switch_ocr, crop_gray, crop_w, crop_h, rect, &ocr_res);
     }
 
+    const u32 ocr_ms = ms_since(ocr_t0);
     unsigned nlines = recognized ? ocr_res.line_count : 0;
+    const u64 dict_t0 = armGetSystemTick();
+    const uint32_t pages0 = safir_dict_page_reads(&s_switch_dict);
     unsigned total_chars = collect_scan_words(ocr_res, nlines);
-    safir_engine_unlock();
+    const u32 dict_ms = ms_since(dict_t0);
+    const uint32_t pages = safir_dict_page_reads(&s_switch_dict) - pages0;
     s_last_scan_ms = (u32)(armTicksToNs(armGetSystemTick() - scan_t0) / 1000000ULL);
+    evlog("scan #%u: times ms: capture %u, lines %u, model reload %u, ocr %u, dictionary %u (%u page reads), total %u",
+          (unsigned)s_scan_no, (unsigned)capture_ms, (unsigned)plan_ms, (unsigned)s_reload_ms, (unsigned)ocr_ms,
+          (unsigned)dict_ms, (unsigned)pages, (unsigned)s_last_scan_ms);
 
     if (total_chars == 0) {
         if (plan_rc != 0) dump_debug_capture(crop_gray, crop_w, crop_h); /* else see debug_scan.txt */
         set_pill("No text found (%u ms)", (unsigned)s_last_scan_ms);
-        snprintf(s_detail, sizeof(s_detail), "%s\n%s\nSaved debug_screen.jpg and debug_crop.pgm in sdmc:/switch/safir/",
-                 safir_ocr_vocr_last_error(), s_region_status);
+        snprintf(s_detail, sizeof(s_detail), "%s\n%s\nSaved %s in sdmc:/switch/safir/", safir_ocr_vocr_last_error(),
+                 s_region_status, plan_rc != 0 ? "debug_crop.pgm" : "debug_scan.txt");
         return;
     }
     char timing[48];
@@ -975,7 +1008,6 @@ static void load_entries(int word) {
 
     static SafirDictMatch matches[kMaxEntries];
     static char gloss[1536];
-    safir_engine_lock();
     size_t n = safir_dict_lookup_all(&s_switch_dict, &line, w.char_start, matches, kMaxEntries);
     for (size_t i = 0; i < n; ++i) {
         char hw[64], rd[64];
@@ -989,7 +1021,6 @@ static void load_entries(int word) {
         safir_text_line_to_utf8(&piece, surface, sizeof(surface));
         s_entries.push_back({ hw, strcmp(rd, hw) == 0 ? std::string() : std::string(rd), matches[i].rule, gloss, surface });
     }
-    safir_engine_unlock();
 }
 
 static void select_word(int idx) {
@@ -1250,7 +1281,8 @@ private:
             return std::string(b);
         };
         const s32 avail = width - 2 * kPad;
-        std::vector<s32> cw(cps.size());
+        static std::vector<s32> cw; /* reused: no allocation per frame */
+        cw.assign(cps.size(), 0);
         for (size_t i = 0; i < cps.size(); ++i) cw[i] = text_w(r, cp_str(cps[i]).c_str(), kStripFont);
         size_t a0 = w.char_start, a1 = std::min<size_t>(w.char_start + w.char_count, cps.size());
         s32 used = 0;
@@ -1383,6 +1415,33 @@ static void release_scan_state(void) {
     tsl::gfx::Renderer::flushGlyphCache();
 }
 
+/* Which game is in front, and its games.ini region. The overlay is loaded once and stays
+ * resident while games are switched, so this runs every time it opens, not only at load
+ * (where the ID was the wrong game's, or none: games.ini regions never applied). */
+static void refresh_game_region(void) {
+    u64 pid = 0, tid = 0;
+    if (R_SUCCEEDED(s_rc_pminfo) && R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid)) && pid != 0) {
+        if (R_FAILED(pminfoGetProgramId(&tid, pid))) tid = 0;
+    }
+    if (s_region_known && tid == s_title_id) return;
+    s_title_id = tid;
+    s_region_known = true;
+    SafirRect r;
+    bool from_ini = tid != 0 && safir_games_ini_load(kGamesIniPath, tid, &r);
+    if (!from_ini) {
+        /* Default: scan the whole screen (any text box layout, NVL pages). */
+        r = safir_rect_make(0, 0, SAFIR_SCREEN_WIDTH, SAFIR_SCREEN_HEIGHT);
+    }
+    s_scan_rect = r;
+    if (tid != 0) {
+        snprintf(s_region_status, sizeof(s_region_status), "Game %016llX: %s %u,%u %ux%u", (unsigned long long)tid,
+                 from_ini ? "region from games.ini" : "full screen", r.x, r.y, r.w, r.h);
+    } else {
+        snprintf(s_region_status, sizeof(s_region_status), "No game detected: full screen");
+    }
+    evlog("%s", s_region_status);
+}
+
 static void start_scan_after(int frames) {
     if (s_capture_countdown > 0) {
         evlog("scan request (%d frames) ignored: countdown already %d", frames, s_capture_countdown);
@@ -1415,23 +1474,31 @@ public:
          * onShow() alone was not enough: after closing with the scan combo (libtesla hides
          * from its input thread, mid-frame) while a popup was open, reopening showed the
          * old popup instead of rescanning; closing with B first worked (console 2026-11-05).
-         * The tick is taken at the END of update(), so a 400 ms scan inside it never counts. */
+         * The tick is taken at the END of update(), so a 400 ms scan inside it never counts.
+         * A gap alone could also be one slow frame (a cold dictionary read on a slow card), so
+         * it counts from 100 ms only after an onHide; without one it must be 2 s. */
         static u64 s_last_update_end = 0;
+        static bool s_hidden_since_scan = false;
         const u64 now = armGetSystemTick();
         if (s_hide_count != s_hide_logged) {
             s_hide_logged = s_hide_count;
+            s_hidden_since_scan = true;
             evlog("onHide #%u seen by update()", (unsigned)s_hide_logged);
         }
-        if (s_last_update_end != 0 && armTicksToNs(now - s_last_update_end) > 500000000ULL) {
-            evlog("update gap %llu ms: treated as reopen", (unsigned long long)(armTicksToNs(now - s_last_update_end) / 1000000ULL));
+        const u64 gap_ms = s_last_update_end ? armTicksToNs(now - s_last_update_end) / 1000000ULL : 0;
+        if (gap_ms > 2000 || (s_hidden_since_scan && gap_ms > 100)) {
+            evlog("update gap %llu ms%s: treated as reopen", (unsigned long long)gap_ms,
+                  s_hidden_since_scan ? " after onHide" : "");
             s_scan_on_show = true;
         }
+        if (s_scan_on_show) s_hidden_since_scan = false;
 
         if (!s_assets_probed) {
             load_assets_if_needed();
         }
         if (s_scan_on_show) {
             evlog("scan on show: countdown was %d", s_capture_countdown);
+            refresh_game_region();
             s_scan_on_show = false;
             s_capture_failures = 0;
             s_capture_countdown = 0; /* a countdown left from before the close must not block it */
@@ -1540,34 +1607,8 @@ public:
 
         safir_ledger_init();
 
-        u64 app_pid = 0;
-        u64 app_tid = 0;
-        if (R_SUCCEEDED(s_rc_pminfo) &&
-            R_SUCCEEDED(pmdmntGetApplicationProcessId(&app_pid)) && app_pid != 0) {
-            pminfoGetProgramId(&app_tid, app_pid);
-        }
-
-        s_switch_cfg.games_ini_path = "sdmc:/config/safir/games.ini";
-        s_switch_cfg.title_id = app_tid ? app_tid : 0x0100ABCD12340000ULL;
-
-        safir_ui_init(&s_switch_dict, nullptr, nullptr, &s_switch_cfg);
-        safir_bg_worker_init(nullptr, &s_switch_dict);
-        {
-            /* After both inits: they reset their region to the old default. */
-            SafirRect r;
-            bool from_ini = safir_games_ini_load(s_switch_cfg.games_ini_path, s_switch_cfg.title_id, &r);
-            if (!from_ini) {
-                /* Default: scan the whole screen (any text box layout, NVL pages). */
-                r = safir_rect_make(0, 0, SAFIR_SCREEN_WIDTH, SAFIR_SCREEN_HEIGHT);
-            }
-            s_scan_rect = r;
-            safir_bg_worker_set_dialogue_rect(r);
-            snprintf(s_region_status, sizeof(s_region_status), "Game %016llX: %s %u,%u %ux%u",
-                     (unsigned long long)s_switch_cfg.title_id,
-                     from_ini ? "region from games.ini" : "full screen", r.x, r.y, r.w, r.h);
-        }
-        safir_bg_worker_set_enabled(false); /* never auto-start the Core-3 worker */
-        evlog("overlay loaded: %s; scan combo %s", s_region_status, s_scan_combo_name);
+        refresh_game_region();
+        evlog("overlay loaded; scan combo %s", s_scan_combo_name);
         evlog("%s", s_ocr_model_note);
     }
 
@@ -1576,13 +1617,10 @@ public:
          * _lseek_r <- _fclose_r <- exit) came from unmounting sdmc while the
          * dictionary's FILE* was still open: libc's exit() then flushed that stream
          * through a NULL devoptab entry. Stop the worker, close every file, THEN unmount. */
-        safir_bg_worker_stop();
-        safir_ui_cleanup();
+        evlog_hold(false);
 
-        safir_engine_lock();
         safir_dict_close(&s_switch_dict);
         s_dict_loaded = false;
-        safir_engine_unlock();
 
         safir_dict_set_page_cache(&s_switch_dict, nullptr, 0);
         free(s_page_cache);
